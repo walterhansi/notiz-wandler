@@ -1,0 +1,281 @@
+// core.js – plattformneutrale Kernlogik (läuft im Browser und in Node)
+// Eingabe: RGBA-Pixel einer gerenderten PDF-Seite. Ausgabe: freigestellte Tinte,
+// einzeln abgrenzbare Zeichnungen und eine Excalidraw-Szene.
+
+export const DEFAULTS = {
+  gridCut: 0.2,     // Alpha-Schwelle: alles darunter gilt als Raster (Punkte ~0,13)
+  gap: 50,          // max. Abstand (px bei 1600 px Seitenbreite), bei dem Striche noch zusammengehören
+  minSize: 20,      // kleinste Kantenlänge (px) einer Zeichnung
+  minPixels: 60,    // mindestens so viele Tintenpixel
+  pad: 8,           // Rand um jede ausgeschnittene Zeichnung (px)
+  block: 8,         // Rastergröße der Gruppierung (px)
+};
+
+/** Häufigste Farbe der Seite = Papier. */
+export function estimateBackground(rgba) {
+  const bins = new Uint32Array(4096);
+  const sum = new Float64Array(4096 * 3);
+  const n = rgba.length / 4;
+  const step = Math.max(1, Math.floor(n / 400000));
+  for (let p = 0; p < n; p += step) {
+    const i = p * 4;
+    const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+    const k = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+    bins[k]++;
+    sum[k * 3] += r; sum[k * 3 + 1] += g; sum[k * 3 + 2] += b;
+  }
+  let best = 0;
+  for (let k = 1; k < 4096; k++) if (bins[k] > bins[best]) best = k;
+  const c = bins[best] || 1;
+  return [sum[best * 3] / c, sum[best * 3 + 1] / c, sum[best * 3 + 2] / c].map(Math.round);
+}
+
+function ca(c, b) { // color-to-alpha für einen Kanal
+  if (c < b) return (b - c) / b;
+  if (c > b) return (c - b) / (255 - b);
+  return 0;
+}
+
+/**
+ * Entfernt Papier + Raster: Farbe-zu-Alpha gegen das Papier,
+ * alles unter `cut` (die blassen Rasterpunkte) wird transparent.
+ * Liefert { ink: RGBA mit Alpha, count: Anzahl Tintenpixel }.
+ */
+export function extractInk(rgba, bg, cut) {
+  const out = new Uint8ClampedArray(rgba.length);
+  const [br, bgg, bb] = bg;
+  let count = 0;
+  for (let i = 0; i < rgba.length; i += 4) {
+    const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+    const a = Math.max(ca(r, br), ca(g, bgg), ca(b, bb));
+    if (a < cut) continue;
+    out[i] = (r - br) / a + br;
+    out[i + 1] = (g - bgg) / a + bgg;
+    out[i + 2] = (b - bb) / a + bb;
+    out[i + 3] = a * 255 + 0.5;
+    count++;
+  }
+  return { ink: out, count };
+}
+
+// Quadratische Dilatation (Radius r) auf einer Bitmaske, getrennt in x und y.
+function dilate(mask, w, h, r) {
+  if (r <= 0) return mask.slice();
+  const tmp = new Uint8Array(w * h);
+  const out = new Uint8Array(w * h);
+  const pre = new Int32Array(Math.max(w, h) + 1);
+  for (let y = 0; y < h; y++) {
+    pre[0] = 0;
+    for (let x = 0; x < w; x++) pre[x + 1] = pre[x] + mask[y * w + x];
+    for (let x = 0; x < w; x++) {
+      const a = Math.max(0, x - r), b = Math.min(w, x + r + 1);
+      tmp[y * w + x] = pre[b] - pre[a] > 0 ? 1 : 0;
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    pre[0] = 0;
+    for (let y = 0; y < h; y++) pre[y + 1] = pre[y] + tmp[y * w + x];
+    for (let y = 0; y < h; y++) {
+      const a = Math.max(0, y - r), b = Math.min(h, y + r + 1);
+      out[y * w + x] = pre[b] - pre[a] > 0 ? 1 : 0;
+    }
+  }
+  return out;
+}
+
+/**
+ * Teilt die Tinte in einzeln abgrenzbare Zeichnungen.
+ * Gruppiert über einen Blockraster + Dilatation, dann zusammenhängende Komponenten.
+ */
+export function segment(ink, w, h, opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
+  const B = o.block;
+  const bw = Math.ceil(w / B), bh = Math.ceil(h / B);
+  const mask = new Uint8Array(bw * bh);
+  for (let y = 0; y < h; y++) {
+    const by = (y / B) | 0;
+    for (let x = 0; x < w; x++) {
+      if (ink[(y * w + x) * 4 + 3]) mask[by * bw + ((x / B) | 0)] = 1;
+    }
+  }
+  const r = Math.max(0, Math.round(o.gap / 2 / B));
+  const dil = dilate(mask, bw, bh, r);
+
+  // Komponenten (8er-Nachbarschaft) per BFS
+  const label = new Int32Array(bw * bh);
+  let n = 0;
+  const queue = new Int32Array(bw * bh);
+  for (let s = 0; s < dil.length; s++) {
+    if (!dil[s] || label[s]) continue;
+    n++;
+    let qh = 0, qt = 0;
+    queue[qt++] = s; label[s] = n;
+    while (qh < qt) {
+      const c = queue[qh++];
+      const cx = c % bw, cy = (c / bw) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cy + dy;
+        if (ny < 0 || ny >= bh) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cx + dx;
+          if (nx < 0 || nx >= bw) continue;
+          const k = ny * bw + nx;
+          if (dil[k] && !label[k]) { label[k] = n; queue[qt++] = k; }
+        }
+      }
+    }
+  }
+
+  // Tintenpixel -> Komponente, Bounding-Box und Pixelzahl
+  const bx0 = new Int32Array(n + 1).fill(1 << 30), by0 = new Int32Array(n + 1).fill(1 << 30);
+  const bx1 = new Int32Array(n + 1).fill(-1), by1 = new Int32Array(n + 1).fill(-1);
+  const cnt = new Int32Array(n + 1);
+  for (let y = 0; y < h; y++) {
+    const by = (y / B) | 0;
+    for (let x = 0; x < w; x++) {
+      if (!ink[(y * w + x) * 4 + 3]) continue;
+      const l = label[by * bw + ((x / B) | 0)];
+      cnt[l]++;
+      if (x < bx0[l]) bx0[l] = x;
+      if (x > bx1[l]) bx1[l] = x;
+      if (y < by0[l]) by0[l] = y;
+      if (y > by1[l]) by1[l] = y;
+    }
+  }
+
+  let items = [];
+  for (let l = 1; l <= n; l++) {
+    if (!cnt[l]) continue;
+    const tw = bx1[l] - bx0[l] + 1, th = by1[l] - by0[l] + 1;
+    if (cnt[l] < o.minPixels || Math.max(tw, th) < o.minSize) continue;
+    const x0 = Math.max(0, bx0[l] - o.pad), y0 = Math.max(0, by0[l] - o.pad);
+    const x1 = Math.min(w, bx1[l] + 1 + o.pad), y1 = Math.min(h, by1[l] + 1 + o.pad);
+    items.push({ label: l, x: x0, y: y0, w: x1 - x0, h: y1 - y0, pixels: cnt[l] });
+  }
+  items = readingOrder(items);
+
+  // Ausschnitte: nur Pixel, die zu dieser Zeichnung gehören
+  for (const it of items) {
+    const crop = new Uint8ClampedArray(it.w * it.h * 4);
+    for (let y = 0; y < it.h; y++) {
+      const sy = it.y + y, by = (sy / B) | 0;
+      for (let x = 0; x < it.w; x++) {
+        const sx = it.x + x;
+        if (label[by * bw + ((sx / B) | 0)] !== it.label) continue;
+        const si = (sy * w + sx) * 4, di = (y * it.w + x) * 4;
+        crop[di] = ink[si]; crop[di + 1] = ink[si + 1]; crop[di + 2] = ink[si + 2]; crop[di + 3] = ink[si + 3];
+      }
+    }
+    it.rgba = crop;
+  }
+  return items;
+}
+
+/** Zeilenweise von oben nach unten, innerhalb der Zeile von links nach rechts. */
+export function readingOrder(items) {
+  const s = [...items].sort((a, b) => a.y - b.y || a.x - b.x);
+  const rows = [];
+  for (const it of s) {
+    const cy = it.y + it.h / 2;
+    const row = rows.find((r) => cy >= r.top && cy <= r.bottom);
+    if (row) {
+      row.items.push(it);
+      row.top = Math.min(row.top, it.y);
+      row.bottom = Math.max(row.bottom, it.y + it.h);
+    } else {
+      rows.push({ top: it.y, bottom: it.y + it.h, items: [it] });
+    }
+  }
+  rows.sort((a, b) => a.top - b.top);
+  return rows.flatMap((r) => r.items.sort((a, b) => a.x - b.x));
+}
+
+// ---------- Excalidraw ----------
+
+const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+/** Aufsteigende Sortierschlüssel im Stil von fractional-indexing: a0..az, b00, b01, … */
+export function orderKey(i) {
+  if (i < 62) return 'a' + B62[i];
+  const j = i - 62;
+  return 'b' + B62[Math.floor(j / 62) % 62] + B62[j % 62];
+}
+
+export async function sha1Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function bytesToDataURL(bytes, mime = 'image/png') {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return `data:${mime};base64,${btoa(bin)}`;
+}
+
+const rnd = () => Math.floor(Math.random() * 2 ** 31);
+
+function baseEl(type, i, x, y, width, height, now) {
+  return {
+    id: 'ao' + Math.random().toString(36).slice(2, 10) + i.toString(36),
+    type, x, y, width, height, angle: 0,
+    strokeColor: 'transparent', backgroundColor: 'transparent',
+    fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid', roughness: 0, opacity: 100,
+    groupIds: [], frameId: null, index: orderKey(i), roundness: null,
+    seed: rnd(), version: 1, versionNonce: rnd(), isDeleted: false,
+    boundElements: null, updated: now, link: null, locked: false,
+  };
+}
+
+/**
+ * pages: [{ width, height, figures: [{x,y,w,h,dataURL,fileId}] }]
+ * Jede Zeichnung wird ein eigenes, einzeln anklickbares Bildelement.
+ */
+export function buildScene(pages, { outline = false, source = 'ao-notiz-wandler', pageGap = 160 } = {}) {
+  const now = Date.now();
+  const elements = [];
+  const files = {};
+  let oy = 0, idx = 0;
+  for (const p of pages) {
+    if (outline) {
+      const r = baseEl('rectangle', idx++, 0, oy, p.width, p.height, now);
+      r.strokeColor = '#9aa0a6'; r.strokeStyle = 'dashed'; r.locked = true;
+      elements.push(r);
+    }
+    for (const f of p.figures) {
+      const el = baseEl('image', idx++, f.x, oy + f.y, f.w, f.h, now);
+      el.status = 'saved';
+      el.fileId = f.fileId;
+      el.scale = [1, 1];
+      el.crop = null;
+      elements.push(el);
+      files[f.fileId] = { mimeType: 'image/png', id: f.fileId, dataURL: f.dataURL, created: now, lastRetrieved: now };
+    }
+    oy += p.height + pageGap;
+  }
+  return {
+    type: 'excalidraw', version: 2, source,
+    elements,
+    appState: { gridSize: null, viewBackgroundColor: '#ffffff' },
+    files,
+  };
+}
+
+// ---------- Text & Namen ----------
+
+export function buildTxt(sourceName, lang, pages) {
+  const out = [`Quelle: ${sourceName}`, `OCR: Tesseract (${lang})`, ''];
+  for (const p of pages) {
+    out.push(`=== Seite ${p.n} ===`);
+    out.push(p.text && p.text.trim() ? p.text.trim() : '(kein Text erkannt)');
+    out.push('');
+  }
+  return out.join('\n');
+}
+
+export function baseName(name) { return name.replace(/\.pdf$/i, ''); }
+
+/** "name.ext" bzw. "name (2).ext", falls schon vergeben. `exists` darf async sein. */
+export async function uniqueName(base, ext, exists) {
+  let n = 1, cand = `${base}.${ext}`;
+  while (await exists(cand)) { n++; cand = `${base} (${n}).${ext}`; }
+  return cand;
+}

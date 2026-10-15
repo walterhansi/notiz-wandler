@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ao Notiz-Wandler</title>
+<meta name="theme-color" content="#131419">
+<meta name="description" content="Wandelt Notiz-PDFs in Excalidraw-Dateien (jede Zeichnung einzeln anklickbar, ohne Raster) und Text per OCR um.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <img src="icons/icon-192.png" alt="" width="40" height="40">
+  <div>
+    <h1>Notiz-Wandler</h1>
+    <p class="sub">PDF → Excalidraw (ohne Raster, jede Zeichnung einzeln) + OCR-Text</p>
+  </div>
+</header>
+
+<main>
+  <section class="card" id="src">
+    <h2>1 · PDFs wählen</h2>
+    <div class="row">
+      <button id="btnFiles" class="primary">PDF-Dateien wählen …</button>
+      <button id="btnDir" class="ghost">Ordner öffnen …</button>
+    </div>
+    <p class="hint" id="outHint"></p>
+    <input type="file" id="fileInput" accept=".pdf,application/pdf" multiple hidden>
+  </section>
+
+  <section class="card" id="listCard" hidden>
+    <div class="row between">
+      <h2>2 · Auswahl</h2>
+      <label class="chk"><input type="checkbox" id="selAll" checked> alle</label>
+    </div>
+    <ul id="fileList" class="files"></ul>
+  </section>
+
+  <section class="card" id="setCard" hidden>
+    <h2>3 · Einstellungen</h2>
+    <div class="grid">
+      <label>Raster-Schwelle <output id="oCut"></output>
+        <input type="range" id="gridCut" min="0.05" max="0.6" step="0.01" value="0.2">
+        <small>höher = mehr Raster wird entfernt (zu hoch: helle Striche gehen verloren)</small></label>
+      <label>Gruppier-Abstand <output id="oGap"></output>
+        <input type="range" id="gap" min="10" max="200" step="5" value="50">
+        <small>größer = nahe Teile verschmelzen zu einer Zeichnung</small></label>
+      <label>Mindestgröße <output id="oMin"></output>
+        <input type="range" id="minSize" min="5" max="120" step="5" value="20">
+        <small>kleinere Krümel werden ignoriert</small></label>
+    </div>
+    <div class="row wrap">
+      <label class="chk"><input type="checkbox" id="optOcr" checked> OCR-Text in .txt</label>
+      <label class="chk">Sprache
+        <select id="ocrLang"><option value="deu+eng">Deutsch + Englisch</option><option value="deu">Deutsch</option><option value="eng">Englisch</option></select></label>
+      <label class="chk"><input type="checkbox" id="optConf" checked> unsichere OCR-Treffer ausblenden</label>
+      <label class="chk"><input type="checkbox" id="optOutline"> Seitenrahmen in Excalidraw</label>
+    </div>
+    <p class="hint">OCR liest <b>gedruckten</b> Text zuverlässig, Handschrift nur eingeschränkt. Beim ersten OCR-Lauf werden Sprachdaten aus dem Internet geladen.</p>
+  </section>
+
+  <section class="card" id="runCard" hidden>
+    <div class="row">
+      <button id="btnRun" class="primary">Umwandeln</button>
+      <span id="runState" class="muted"></span>
+    </div>
+    <div class="bar" id="barWrap" hidden><div id="bar"></div></div>
+  </section>
+
+  <section id="results"></section>
+</main>
+
+<footer>
+  <p>Alles läuft lokal im Browser – die PDFs werden nicht hochgeladen (nur die OCR-Sprachdaten werden geladen).</p>
+  <p><button id="btnUpdate" class="ghost">Aktualisieren</button> <span class="muted" id="ver"></span></p>
+</footer>
+<script type="module" src="app.js"></script>
+</body>
+</html>
