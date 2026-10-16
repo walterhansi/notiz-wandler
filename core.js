@@ -9,6 +9,10 @@ export const DEFAULTS = {
   minPixels: 60,    // mindestens so viele Tintenpixel
   pad: 8,           // Rand um jede ausgeschnittene Zeichnung (px)
   block: 8,         // Rastergröße der Gruppierung (px)
+  photos: true,     // flächige Bilder (Fotos) erkennen und als Rechteck übernehmen
+  drawings: true,   // übrige Striche/Zeichnungen/Text gruppieren und ausschneiden
+  solid: 16,        // Fotos: Mindestdicke einer 'vollen' Fläche (px); dünne Striche zählen nicht
+  minPhoto: 80,     // Fotos: kleinste Kantenlänge (px)
 };
 
 /** Häufigste Farbe der Seite = Papier. */
@@ -171,6 +175,113 @@ export function segment(ink, w, h, opts = {}) {
   return items;
 }
 
+
+// ---------- Fotos / flächige Bilder ----------
+
+function label8(mask, w, h) {
+  const label = new Int32Array(w * h);
+  const queue = new Int32Array(w * h);
+  let n = 0;
+  for (let s = 0; s < mask.length; s++) {
+    if (!mask[s] || label[s]) continue;
+    n++;
+    let qh = 0, qt = 0;
+    queue[qt++] = s; label[s] = n;
+    while (qh < qt) {
+      const c = queue[qh++];
+      const cx = c % w, cy = (c / w) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cy + dy; if (ny < 0 || ny >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cx + dx; if (nx < 0 || nx >= w) continue;
+          const k = ny * w + nx;
+          if (mask[k] && !label[k]) { label[k] = n; queue[qt++] = k; }
+        }
+      }
+    }
+  }
+  return { label, n };
+}
+
+/**
+ * Findet flächige Bilder: Zellen, die zu >= 50 % mit Farbe gefüllt sind, werden um `solid` px
+ * geöffnet (Erosion + Dilatation) – dünne Striche und Text verschwinden, Fotos bleiben.
+ * Liefert die Fotos (Rechtecke) und die Tinte ohne diese Fotos.
+ */
+export function findPhotos(ink, w, h, opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
+  const C = 4;
+  const cw = Math.ceil(w / C), ch = Math.ceil(h / C);
+  const cnt = new Uint16Array(cw * ch);
+  for (let y = 0; y < h; y++) {
+    const cy = (y / C) | 0;
+    for (let x = 0; x < w; x++) if (ink[(y * w + x) * 4 + 3]) cnt[cy * cw + ((x / C) | 0)]++;
+  }
+  const solid = new Uint8Array(cw * ch);
+  for (let i = 0; i < solid.length; i++) solid[i] = cnt[i] >= (C * C) / 2 ? 1 : 0;
+  const r = Math.max(1, Math.round(o.solid / C));
+  const inv = solid.map((v) => 1 - v);
+  const eroded = dilate(inv, cw, ch, r).map((v) => 1 - v);
+  const opened = dilate(eroded, cw, ch, r);
+  // nicht über die ursprüngliche Fläche hinaus
+  for (let i = 0; i < opened.length; i++) if (!solid[i]) opened[i] = 0;
+  const { label, n } = label8(opened, cw, ch);
+  const x0 = new Int32Array(n + 1).fill(1 << 30), y0 = new Int32Array(n + 1).fill(1 << 30);
+  const x1 = new Int32Array(n + 1).fill(-1), y1 = new Int32Array(n + 1).fill(-1);
+  const px = new Int32Array(n + 1);
+  for (let y = 0; y < h; y++) {
+    const cy = (y / C) | 0;
+    for (let x = 0; x < w; x++) {
+      if (!ink[(y * w + x) * 4 + 3]) continue;
+      const l = label[cy * cw + ((x / C) | 0)];
+      if (!l) continue;
+      px[l]++;
+      if (x < x0[l]) x0[l] = x; if (x > x1[l]) x1[l] = x;
+      if (y < y0[l]) y0[l] = y; if (y > y1[l]) y1[l] = y;
+    }
+  }
+  const keep = new Uint8Array(n + 1);
+  const photos = [];
+  for (let l = 1; l <= n; l++) {
+    if (!px[l]) continue;
+    const bw = x1[l] - x0[l] + 1, bh = y1[l] - y0[l] + 1;
+    if (Math.min(bw, bh) < o.minPhoto || px[l] < 0.4 * bw * bh) continue;
+    keep[l] = 1;
+    photos.push({ kind: 'photo', x: x0[l], y: y0[l], w: bw, h: bh, pixels: px[l] });
+  }
+  let rest = ink;
+  if (photos.length) {
+    rest = ink.slice();
+    const m = C + 2; // Randreste (Zellraster, Kantenglättung) mit entfernen
+    for (const p of photos) {
+      const ya = Math.max(0, p.y - m), yb = Math.min(h, p.y + p.h + m);
+      const xa = Math.max(0, p.x - m), xb = Math.min(w, p.x + p.w + m);
+      for (let y = ya; y < yb; y++) for (let x = xa; x < xb; x++) rest[(y * w + x) * 4 + 3] = 0;
+    }
+  }
+  return { photos, rest };
+}
+
+function cropOpaque(src, w, x, y, cwid, chei) {
+  const out = new Uint8ClampedArray(cwid * chei * 4);
+  for (let j = 0; j < chei; j++) {
+    const si = ((y + j) * w + x) * 4;
+    out.set(src.subarray(si, si + cwid * 4), j * cwid * 4);
+  }
+  for (let i = 3; i < out.length; i += 4) out[i] = 255;
+  return out;
+}
+
+/** Fotos als Rechtecke (Originalfarben) + übrige Zeichnungen/Text gruppiert, gemeinsame Lesereihenfolge. */
+export function segmentAll(src, ink, w, h, opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
+  let photos = [], rest = ink;
+  if (o.photos) ({ photos, rest } = findPhotos(ink, w, h, o));
+  for (const p of photos) p.rgba = cropOpaque(src, w, p.x, p.y, p.w, p.h);
+  const drawings = o.drawings ? segment(rest, w, h, o).map((d) => ({ ...d, kind: 'drawing' })) : [];
+  return readingOrder([...photos, ...drawings]);
+}
+
 /** Zeilenweise von oben nach unten, innerhalb der Zeile von links nach rechts. */
 export function readingOrder(items) {
   const s = [...items].sort((a, b) => a.y - b.y || a.x - b.x);
@@ -247,7 +358,7 @@ export function buildScene(pages, { outline = false, source = 'ao-notiz-wandler'
       el.scale = [1, 1];
       el.crop = null;
       elements.push(el);
-      files[f.fileId] = { mimeType: 'image/png', id: f.fileId, dataURL: f.dataURL, created: now, lastRetrieved: now };
+      files[f.fileId] = { mimeType: f.mime || 'image/png', id: f.fileId, dataURL: f.dataURL, created: now, lastRetrieved: now };
     }
     oy += p.height + pageGap;
   }

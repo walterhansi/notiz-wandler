@@ -1,6 +1,6 @@
 import * as pdfjs from './lib/pdf.min.mjs';
 import {
-  DEFAULTS, estimateBackground, extractInk, segment, buildScene,
+  DEFAULTS, estimateBackground, extractInk, segmentAll, buildScene,
   bytesToDataURL, sha1Hex, buildTxt, baseName, uniqueName,
 } from './core.js';
 
@@ -11,7 +11,7 @@ const PDF_OPTS = {
   isEvalSupported: false,
 };
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const APP_VERSION = '1.1';
+const APP_VERSION = '1.2';
 const PAGE_W = 1600; // Zielbreite beim Rendern (px)
 
 const $ = (id) => document.getElementById(id);
@@ -99,6 +99,7 @@ $('btnDir').onclick = async () => {
 function settings() {
   return {
     gridCut: +$('gridCut').value, gap: +$('gap').value, minSize: +$('minSize').value,
+    photos: $('optPhotos').checked, drawings: $('optDrawings').checked,
     ocr: $('optOcr').checked, lang: $('ocrLang').value, outline: $('optOutline').checked, conf: $('optConf').checked,
   };
 }
@@ -112,10 +113,10 @@ syncOut();
 
 // ---------- Hilfsfunktionen: Canvas / Speichern ----------
 const mkCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
-const toPng = (canvas) => new Promise((res, rej) => canvas.toBlob(async (b) => {
-  if (!b) return rej(new Error('PNG-Erzeugung fehlgeschlagen'));
+const toBytes = (canvas, mime = 'image/png') => new Promise((res, rej) => canvas.toBlob(async (b) => {
+  if (!b) return rej(new Error('Bilderzeugung fehlgeschlagen'));
   res(new Uint8Array(await b.arrayBuffer()));
-}, 'image/png'));
+}, mime, 0.92));
 
 async function saveBlob(base, ext, blob) {
   if (dirHandle) {
@@ -183,7 +184,7 @@ async function processFile(entry, st, onProgress, status) {
   const task = pdfjs.getDocument({ data: buf, ...PDF_OPTS });
   const doc = await task.promise;
   const pagesOut = [], ocrPages = [], thumbs = [];
-  let figTotal = 0;
+  let figTotal = 0, nPhotos = 0;
   try {
     for (let n = 1; n <= doc.numPages; n++) {
       onProgress((n - 1) / doc.numPages, `Seite ${n}/${doc.numPages}: rendern …`);
@@ -202,15 +203,21 @@ async function processFile(entry, st, onProgress, status) {
       await new Promise((r) => setTimeout(r)); // UI atmen lassen
       const bg = estimateBackground(rgba);
       const { ink, count } = extractInk(rgba, bg, st.gridCut);
-      const figs = segment(ink, w, h, { gap: st.gap, minSize: st.minSize });
+      const figs = segmentAll(rgba, ink, w, h, { gap: st.gap, minSize: st.minSize, photos: st.photos, drawings: st.drawings });
       figTotal += figs.length;
 
       const figsOut = [];
+      const photoCanvases = new Map();
+      const canvasForPreview = (f) => photoCanvases.get(f);
       for (const f of figs) {
         const c = mkCanvas(f.w, f.h);
+        if (f.kind === 'photo') photoCanvases.set(f, c);
         c.getContext('2d').putImageData(new ImageData(f.rgba, f.w, f.h), 0, 0);
-        const dataURL = bytesToDataURL(await toPng(c));
-        figsOut.push({ x: f.x, y: f.y, w: f.w, h: f.h, dataURL, fileId: await sha1Hex(dataURL) });
+        const isPhoto = f.kind === 'photo';
+        const mime = isPhoto ? 'image/jpeg' : 'image/png';
+        const dataURL = bytesToDataURL(await toBytes(c, mime), mime);
+        figsOut.push({ x: f.x, y: f.y, w: f.w, h: f.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
+        if (isPhoto) nPhotos++;
         f.rgba = null;
       }
       pagesOut.push({ width: w, height: h, figures: figsOut });
@@ -221,6 +228,8 @@ async function processFile(entry, st, onProgress, status) {
       const flat = mkCanvas(w, h);
       const fctx = flat.getContext('2d');
       fctx.fillStyle = '#fff'; fctx.fillRect(0, 0, w, h); fctx.drawImage(inkCanvas, 0, 0);
+      // Fotos für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
+      if (st.ocr) for (const f of figs) if (f.kind === 'photo') fctx.fillRect(f.x, f.y, f.w, f.h);
 
       if (st.ocr) {
         if (count >= 200) {
@@ -236,10 +245,13 @@ async function processFile(entry, st, onProgress, status) {
       tctx.fillStyle = '#fff'; tctx.fillRect(0, 0, th.width, th.height);
       tctx.drawImage(flat, 0, 0, th.width, th.height);
       tctx.lineWidth = 2; tctx.font = 'bold 13px system-ui';
+      // Vorschau zeigt die Seite ohne Raster; Fotos darin in Originalfarben
+      for (const f of figs) if (f.kind === 'photo') tctx.drawImage(canvasForPreview(f), f.x * k, f.y * k, f.w * k, f.h * k);
       figs.forEach((f, i) => {
-        tctx.strokeStyle = '#00b5a6';
+        const col = f.kind === 'photo' ? '#f9a73b' : '#00b5a6';
+        tctx.strokeStyle = col;
         tctx.strokeRect(f.x * k, f.y * k, f.w * k, f.h * k);
-        tctx.fillStyle = '#00b5a6'; tctx.fillRect(f.x * k, f.y * k, 22, 18);
+        tctx.fillStyle = col; tctx.fillRect(f.x * k, f.y * k, 22, 18);
         tctx.fillStyle = '#04110f'; tctx.fillText(String(i + 1), f.x * k + 5, f.y * k + 14);
       });
       thumbs.push({ n, canvas: th, count: figs.length });
@@ -253,7 +265,10 @@ async function processFile(entry, st, onProgress, status) {
   if (figTotal > 0) {
     const scene = buildScene(pagesOut, { outline: st.outline });
     const name = await saveBlob(base, 'excalidraw', new Blob([JSON.stringify(scene)], { type: 'application/json' }));
-    saved.push(`${name} – ${figTotal} Zeichnung${figTotal === 1 ? '' : 'en'}, einzeln anklickbar`);
+    const parts = [];
+    if (nPhotos) parts.push(`${nPhotos} Foto${nPhotos === 1 ? '' : 's'}`);
+    if (figTotal - nPhotos) parts.push(`${figTotal - nPhotos} Zeichnung/Textblock${figTotal - nPhotos === 1 ? '' : 'e'}`);
+    saved.push(`${name} – ${parts.join(' + ')}, einzeln anklickbar`);
   }
   let text = '';
   if (st.ocr) {
@@ -272,7 +287,7 @@ function showResult(entry, res, err) {
   if (err) { p.className = 'err'; p.textContent = 'Fehler: ' + (err.message || err); card.append(p); }
   else {
     p.className = res.figTotal || res.saved.length ? 'ok' : 'muted';
-    p.textContent = res.figTotal ? `${res.figTotal} Zeichnung(en) auf ${res.pages} Seite(n) erkannt` : 'Keine Zeichnungen gefunden – Schwelle/Abstand in den Einstellungen anpassen?';
+    p.textContent = res.figTotal ? `${res.figTotal} Element(e) auf ${res.pages} Seite(n) erkannt` : 'Nichts Ausschneidbares gefunden – Schwelle/Abstand in den Einstellungen anpassen?';
     card.append(p);
     if (res.saved.length) {
       const ul = document.createElement('ul');
@@ -283,7 +298,7 @@ function showResult(entry, res, err) {
     for (const t of res.thumbs) {
       const fig = document.createElement('figure');
       fig.append(t.canvas);
-      const cap = document.createElement('figcaption'); cap.textContent = `Seite ${t.n}: ${t.count} Zeichnung(en)`;
+      const cap = document.createElement('figcaption'); cap.textContent = `Seite ${t.n}: ${t.count} Element(e)`;
       fig.append(cap); tb.append(fig);
     }
     card.append(tb);
