@@ -16,19 +16,21 @@
   <img src="icons/icon-192.png" alt="" width="40" height="40">
   <div>
     <h1>Notiz-Wandler</h1>
-    <p class="sub">PDF → Excalidraw (ohne Raster, jede Zeichnung einzeln) + OCR-Text</p>
+    <p class="sub">PDF/Bild/Zwischenablage → Excalidraw (Zeichnungen einzeln) + OCR-Text</p>
   </div>
 </header>
 
 <main>
   <section class="card" id="src">
-    <h2>1 · PDFs wählen</h2>
+    <h2>1 · Quelle wählen</h2>
     <div class="row">
-      <button id="btnFiles" class="primary">PDF-Dateien wählen …</button>
+      <button id="btnFiles" class="primary">Dateien wählen …</button>
       <button id="btnDir" class="ghost">Ordner öffnen …</button>
+      <button id="btnPaste" class="ghost">Aus Zwischenablage</button>
     </div>
     <p class="hint" id="outHint"></p>
-    <input type="file" id="fileInput" accept=".pdf,application/pdf" multiple hidden>
+    <p class="hint">PDFs und Bilder (PNG, JPG …) – auch per Drag &amp; Drop. Screenshot kopieren und <b>Strg+V</b> in diesem Fenster drücken: wird sofort umgewandelt.</p>
+    <input type="file" id="fileInput" accept=".pdf,application/pdf,image/*" multiple hidden>
   </section>
 
   <section class="card" id="listCard" hidden>
@@ -46,7 +48,7 @@
         <input type="range" id="gridCut" min="0.05" max="0.6" step="0.01" value="0.2">
         <small>höher = mehr Raster wird entfernt (zu hoch: helle Striche gehen verloren)</small></label>
       <label>Gruppier-Abstand <output id="oGap"></output>
-        <input type="range" id="gap" min="4" max="200" step="1" value="50">
+        <input type="range" id="gap" min="4" max="200" step="1" value="12">
         <small>größer = nahe Teile verschmelzen zu einer Zeichnung</small></label>
       <label>Mindestgröße <output id="oMin"></output>
         <input type="range" id="minSize" min="5" max="120" step="5" value="20">
@@ -55,8 +57,8 @@
     <div class="row wrap">
       <label class="chk">Was ausschneiden?
         <select id="optMode">
+          <option value="bilder" selected>Nur Bilder (freigestellt) – Text ignorieren</option>
           <option value="alles">Alles: Zeichnungen, Fotos, Text-Blöcke</option>
-          <option value="bilder">Nur Bilder (freigestellt) – Text ignorieren</option>
         </select></label>
     </div>
     <div class="row wrap">

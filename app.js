@@ -11,13 +11,16 @@ const PDF_OPTS = {
   isEvalSupported: false,
 };
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const APP_VERSION = '1.3';
+const APP_VERSION = '1.4';
 const PAGE_W = 1600; // Zielbreite beim Rendern (px)
 
 const $ = (id) => document.getElementById(id);
 let entries = [];       // {id, name, size, modified, getFile}
 let dirHandle = null;   // gesetzt, wenn ein Ordner mit Schreibzugriff gewählt wurde
 let running = false;
+const IMG_RE = /\.(png|jpe?g|bmp|gif|webp)$/i;
+const isImageName = (n) => IMG_RE.test(n);
+const isSource = (n) => /\.pdf$/i.test(n) || isImageName(n);
 
 // ---------- Auswahl ----------
 function setEntries(list, dir) {
@@ -29,8 +32,8 @@ function setEntries(list, dir) {
 
 function updateHint() {
   $('outHint').textContent = dirHandle
-    ? `Speichern in: Ordner „${dirHandle.name}“ – direkt neben den PDFs.`
-    : 'Speichern in: Download-Ordner deines Browsers. Liegen die PDFs dort, landen die Ergebnisse im selben Ordner. Über „Ordner öffnen“ speichert die App direkt in den gewählten Ordner.';
+    ? `Speichern in: Ordner „${dirHandle.name}“ – direkt neben den Quelldateien.`
+    : 'Speichern in: Download-Ordner deines Browsers. Liegen die Dateien dort, landen die Ergebnisse im selben Ordner. Über „Ordner öffnen“ speichert die App direkt in den gewählten Ordner.';
 }
 
 function fmtSize(b) { return b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'; }
@@ -56,14 +59,15 @@ function renderList() {
 function syncSelAll() { $('selAll').checked = entries.length > 0 && entries.every((e) => e.checked); }
 $('selAll').onchange = (ev) => { entries.forEach((e) => (e.checked = ev.target.checked)); renderList(); };
 
-const pdfTypes = [{ description: 'PDF-Dateien', accept: { 'application/pdf': ['.pdf'] } }];
+const pdfTypes = [{ description: 'PDF und Bilder', accept: { 'application/pdf': ['.pdf'], 'image/*': ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'] } }];
+const entryOf = (f) => ({ name: f.name, size: f.size, modified: f.lastModified, getFile: async () => f });
 
 async function pickFiles() {
   if (!window.showOpenFilePicker) { $('fileInput').click(); return; }
   try {
     const hs = await window.showOpenFilePicker({ multiple: true, id: 'ao-pdf', startIn: 'downloads', types: pdfTypes });
     const files = await Promise.all(hs.map((h) => h.getFile()));
-    setEntries(files.map((f) => ({ name: f.name, size: f.size, modified: f.lastModified, getFile: async () => f })), null);
+    setEntries(files.map(entryOf), null);
   } catch (err) {
     if (err && err.name === 'AbortError') return;
     $('fileInput').click();
@@ -71,9 +75,9 @@ async function pickFiles() {
 }
 $('btnFiles').onclick = pickFiles;
 $('fileInput').onchange = (ev) => {
-  const files = [...ev.target.files].filter((f) => /\.pdf$/i.test(f.name));
+  const files = [...ev.target.files].filter((f) => isSource(f.name));
   ev.target.value = '';
-  if (files.length) setEntries(files.map((f) => ({ name: f.name, size: f.size, modified: f.lastModified, getFile: async () => f })), null);
+  if (files.length) setEntries(files.map(entryOf), null);
 };
 
 if (!window.showDirectoryPicker) $('btnDir').hidden = true;
@@ -82,18 +86,56 @@ $('btnDir').onclick = async () => {
     const dir = await window.showDirectoryPicker({ id: 'ao-dir', mode: 'readwrite', startIn: 'downloads' });
     const list = [];
     for await (const [name, h] of dir.entries()) {
-      if (h.kind !== 'file' || !/\.pdf$/i.test(name)) continue;
+      if (h.kind !== 'file' || !isSource(name)) continue;
       const f = await h.getFile();
       list.push({ name, size: f.size, modified: f.lastModified, getFile: async () => h.getFile() });
     }
     list.sort((a, b) => b.modified - a.modified);
-    if (!list.length) { $('outHint').textContent = `Im Ordner „${dir.name}“ liegen keine PDF-Dateien.`; return; }
+    if (!list.length) { $('outHint').textContent = `Im Ordner „${dir.name}“ liegen keine PDFs oder Bilder.`; return; }
     setEntries(list, dir);
   } catch (err) {
     if (err && err.name === 'AbortError') return;
-    $('outHint').textContent = 'Der Browser erlaubt diesen Ordner nicht (Chrome sperrt z. B. den Download-Ordner selbst als Ordnerauswahl). Nutze „PDF-Dateien wählen“ – die Ergebnisse landen dann im Download-Ordner.';
+    $('outHint').textContent = 'Der Browser erlaubt diesen Ordner nicht (Chrome sperrt z. B. den Download-Ordner selbst als Ordnerauswahl). Nutze „Dateien wählen“ – die Ergebnisse landen dann im Download-Ordner.';
   }
 };
+
+// ---------- Zwischenablage und Drag & Drop ----------
+function stamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `Zwischenablage ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+}
+function addClipboardImage(blob) {
+  const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+  const f = new File([blob], `${stamp()}.${ext}`, { type: blob.type, lastModified: Date.now() });
+  entries.forEach((e) => (e.checked = false));
+  entries.push({ ...entryOf(f), id: entries.length, checked: true });
+  renderList();
+  updateHint();
+  if (!running) $('btnRun').click(); // Einfügen = sofort umwandeln
+}
+document.addEventListener('paste', (ev) => {
+  const items = [...(ev.clipboardData?.items || [])].filter((i) => i.kind === 'file' && i.type.startsWith('image/'));
+  if (!items.length) return;
+  ev.preventDefault();
+  for (const it of items) { const f = it.getAsFile(); if (f) addClipboardImage(f); }
+});
+$('btnPaste').onclick = async () => {
+  try {
+    for (const item of await navigator.clipboard.read()) {
+      const type = item.types.find((t) => t.startsWith('image/'));
+      if (type) { addClipboardImage(await item.getType(type)); return; }
+    }
+    $('outHint').textContent = 'In der Zwischenablage liegt kein Bild.';
+  } catch {
+    $('outHint').textContent = 'Zugriff auf die Zwischenablage nicht erlaubt – drücke stattdessen Strg+V in diesem Fenster.';
+  }
+};
+addEventListener('dragover', (ev) => ev.preventDefault());
+addEventListener('drop', (ev) => {
+  ev.preventDefault();
+  const files = [...(ev.dataTransfer?.files || [])].filter((f) => isSource(f.name));
+  if (files.length) setEntries(files.map(entryOf), null);
+});
 
 // ---------- Einstellungen ----------
 function settings() {
@@ -182,30 +224,51 @@ async function recognize(canvas, st, status) {
 // ---------- Verarbeitung ----------
 async function processFile(entry, st, onProgress, status) {
   const file = await entry.getFile();
-  const buf = new Uint8Array(await file.arrayBuffer());
-  const task = pdfjs.getDocument({ data: buf, ...PDF_OPTS });
-  const doc = await task.promise;
+  const isImg = isImageName(entry.name);
+  let task = null, doc = null, total = 1;
+  if (!isImg) {
+    task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), ...PDF_OPTS });
+    doc = await task.promise;
+    total = doc.numPages;
+  }
   const pagesOut = [], ocrPages = [], thumbs = [];
   let figTotal = 0, nPhotos = 0;
   try {
-    for (let n = 1; n <= doc.numPages; n++) {
-      onProgress((n - 1) / doc.numPages, `Seite ${n}/${doc.numPages}: rendern …`);
-      const page = await doc.getPage(n);
-      const v1 = page.getViewport({ scale: 1 });
-      let scale = Math.min(4, Math.max(0.5, PAGE_W / v1.width));
-      if (v1.width * v1.height * scale * scale > 28e6) scale = Math.sqrt(28e6 / (v1.width * v1.height));
-      const vp = page.getViewport({ scale });
-      const w = Math.ceil(vp.width), h = Math.ceil(vp.height);
-      const canvas = mkCanvas(w, h);
-      await page.render({ canvas, viewport: vp, background: '#ffffff' }).promise;
+    for (let n = 1; n <= total; n++) {
+      onProgress((n - 1) / total, `Seite ${n}/${total}: laden …`);
+      let page = null, canvas, w, h, k = 1;
+      if (isImg) {
+        // Bilddatei (Screenshot): Originalauflösung, Größen-Regler auf die Bildbreite umrechnen
+        const bmp = await createImageBitmap(file);
+        let sc = Math.min(1, Math.sqrt(28e6 / (bmp.width * bmp.height)));
+        w = Math.max(1, Math.round(bmp.width * sc)); h = Math.max(1, Math.round(bmp.height * sc));
+        canvas = mkCanvas(w, h);
+        const c0 = canvas.getContext('2d');
+        c0.fillStyle = '#fff'; c0.fillRect(0, 0, w, h); c0.drawImage(bmp, 0, 0, w, h);
+        bmp.close();
+        k = Math.min(2.5, Math.max(0.4, w / PAGE_W));
+      } else {
+        page = await doc.getPage(n);
+        const v1 = page.getViewport({ scale: 1 });
+        let scale = Math.min(4, Math.max(0.5, PAGE_W / v1.width));
+        if (v1.width * v1.height * scale * scale > 28e6) scale = Math.sqrt(28e6 / (v1.width * v1.height));
+        const vp = page.getViewport({ scale });
+        w = Math.ceil(vp.width); h = Math.ceil(vp.height);
+        canvas = mkCanvas(w, h);
+        await page.render({ canvas, viewport: vp, background: '#ffffff' }).promise;
+      }
       const ctx = canvas.getContext('2d');
       const rgba = ctx.getImageData(0, 0, w, h).data;
 
-      status(`Seite ${n}/${doc.numPages}: Raster entfernen, Zeichnungen suchen …`);
+      status(`Seite ${n}/${total}: Raster entfernen, Zeichnungen suchen …`);
       await new Promise((r) => setTimeout(r)); // UI atmen lassen
       const bg = estimateBackground(rgba);
       const { ink, count } = extractInk(rgba, bg, st.gridCut);
-      const figs = segmentAll(rgba, ink, w, h, { gap: st.gap, minSize: st.minSize, photos: st.photos, drawings: st.drawings, images: st.images });
+      const figs = segmentAll(rgba, ink, w, h, {
+        gap: st.gap * k, minSize: st.minSize * k, minPixels: DEFAULTS.minPixels * k * k, pad: Math.round(DEFAULTS.pad * k),
+        solid: DEFAULTS.solid * k, minPhoto: DEFAULTS.minPhoto * k, minCore: DEFAULTS.minCore * k * k,
+        photos: st.photos, drawings: st.drawings, images: st.images,
+      });
       figTotal += figs.length;
 
       const figsOut = [];
@@ -235,34 +298,34 @@ async function processFile(entry, st, onProgress, status) {
 
       if (st.ocr) {
         if (count >= 200) {
-          status(`Seite ${n}/${doc.numPages}: OCR …`);
+          status(`Seite ${n}/${total}: OCR …`);
           ocrPages.push({ n, text: await recognize(flat, st, status) });
         } else ocrPages.push({ n, text: '' });
       }
 
       // Vorschau mit nummerierten Rahmen
-      const tw = Math.min(w, 520), k = tw / w;
-      const th = mkCanvas(tw, Math.round(h * k));
+      const tw = Math.min(w, 520), tk = tw / w;
+      const th = mkCanvas(tw, Math.round(h * tk));
       const tctx = th.getContext('2d');
       tctx.fillStyle = '#fff'; tctx.fillRect(0, 0, th.width, th.height);
       tctx.drawImage(flat, 0, 0, th.width, th.height);
       tctx.lineWidth = 2; tctx.font = 'bold 13px system-ui';
       // Vorschau zeigt die Seite ohne Raster; Fotos darin in Originalfarben
-      for (const f of figs) if (f.kind !== 'drawing') tctx.drawImage(canvasForPreview(f), f.x * k, f.y * k, f.w * k, f.h * k);
+      for (const f of figs) if (f.kind !== 'drawing') tctx.drawImage(canvasForPreview(f), f.x * tk, f.y * tk, f.w * tk, f.h * tk);
       figs.forEach((f, i) => {
         const col = f.kind !== 'drawing' ? '#f9a73b' : '#00b5a6';
         tctx.strokeStyle = col;
-        tctx.strokeRect(f.x * k, f.y * k, f.w * k, f.h * k);
-        tctx.fillStyle = col; tctx.fillRect(f.x * k, f.y * k, 22, 18);
-        tctx.fillStyle = '#04110f'; tctx.fillText(String(i + 1), f.x * k + 5, f.y * k + 14);
+        tctx.strokeRect(f.x * tk, f.y * tk, f.w * tk, f.h * tk);
+        tctx.fillStyle = col; tctx.fillRect(f.x * tk, f.y * tk, 22, 18);
+        tctx.fillStyle = '#04110f'; tctx.fillText(String(i + 1), f.x * tk + 5, f.y * tk + 14);
       });
       thumbs.push({ n, canvas: th, count: figs.length });
       canvas.width = canvas.height = inkCanvas.width = inkCanvas.height = flat.width = flat.height = 0;
-      page.cleanup();
+      if (page) page.cleanup();
     }
-  } finally { await task.destroy(); }
+  } finally { if (task) await task.destroy(); }
 
-  const base = baseName(entry.name);
+  const base = entry.name.replace(/\.(pdf|png|jpe?g|bmp|gif|webp)$/i, '');
   const saved = [];
   if (figTotal > 0) {
     const scene = buildScene(pagesOut, { outline: st.outline });
@@ -278,7 +341,7 @@ async function processFile(entry, st, onProgress, status) {
     const name = await saveBlob(base, 'txt', new Blob([text], { type: 'text/plain;charset=utf-8' }));
     saved.push(`${name} – OCR-Text`);
   }
-  return { saved, thumbs, text, figTotal, pages: doc.numPages };
+  return { saved, thumbs, text, figTotal, pages: total };
 }
 
 function showResult(entry, res, err) {

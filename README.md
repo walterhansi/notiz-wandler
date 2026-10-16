@@ -22,3 +22,6 @@ Den Inhalt dieses Ordners (ohne `tests/`) in ein Repository legen, unter Setting
 * PDF-Rendering: pdf.js 6.2.108 (Legacy-Build, liegt in `lib/`). Raster-Entfernung: Farbe-zu-Alpha gegen die Papierfarbe, Rasterpunkte (sehr blass) fallen unter die Schwelle.
 * OCR: Tesseract.js 5.1.1, wird beim ersten OCR-Lauf von cdn.jsdelivr.net (Bibliothek) und von dessen Standard-Quelle (Sprachdaten) geladen und danach teilweise zwischengespeichert. **Gedruckter Text** wird gut erkannt, **Handschrift** nur eingeschränkt.
 * Excalidraw-Datei: Format `excalidraw` Version 2, Zeichnungen als freigestellte PNGs (transparenter Hintergrund).
+
+## Eingabe
+PDFs und Bilddateien (PNG, JPG …), per Dateiauswahl, Ordner, Drag & Drop oder Zwischenablage (Strg+V, wird sofort umgewandelt). Standardmodus: „Nur Bilder (freigestellt)“.
