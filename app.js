@@ -1,7 +1,7 @@
 import * as pdfjs from './lib/pdf.min.mjs';
 import {
   DEFAULTS, estimateBackground, extractInk, segmentAll, buildScene,
-  bytesToDataURL, sha1Hex, buildTxt, baseName, uniqueName,
+  bytesToDataURL, sha1Hex, buildTxt, uniqueName, cleanOcrLines,
 } from './core.js';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('./lib/pdf.worker.min.mjs', import.meta.url).href;
@@ -11,29 +11,36 @@ const PDF_OPTS = {
   isEvalSupported: false,
 };
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const APP_VERSION = '1.4';
+const APP_VERSION = '1.5';
 const PAGE_W = 1600; // Zielbreite beim Rendern (px)
 
 const $ = (id) => document.getElementById(id);
-let entries = [];       // {id, name, size, modified, getFile}
+let entries = [];       // {id, name, size, modified, getFile, checked}
 let dirHandle = null;   // gesetzt, wenn ein Ordner mit Schreibzugriff gewählt wurde
 let running = false;
 const IMG_RE = /\.(png|jpe?g|bmp|gif|webp)$/i;
 const isImageName = (n) => IMG_RE.test(n);
 const isSource = (n) => /\.pdf$/i.test(n) || isImageName(n);
 
-// ---------- Auswahl ----------
-function setEntries(list, dir) {
-  entries = list.map((e, i) => ({ ...e, id: i, checked: true }));
+let nextId = 1;
+const cache = new Map();   // entry.id -> { sig, res }  (Analyse ohne Speichern)
+const saved = new Map();   // entry.id -> Ergebnis des Speicherns
+let mode = 'bilder';       // 'bilder' | 'alles'
+let gapTouched = false;
+let analyzing = false, saving = false, token = 0, chain = Promise.resolve(), timer = null;
+
+// ---------- Quelle ----------
+function setEntries(list, dir, checkedFn = () => true) {
+  entries = list.map((e, i) => ({ ...e, id: nextId++, checked: checkedFn(i) }));
   dirHandle = dir || null;
-  renderList();
-  updateHint();
+  cache.clear(); saved.clear();
+  renderList(); updateHint(); scheduleAnalyze();
 }
 
 function updateHint() {
   $('outHint').textContent = dirHandle
-    ? `Speichern in: Ordner „${dirHandle.name}“ – direkt neben den Quelldateien.`
-    : 'Speichern in: Download-Ordner deines Browsers. Liegen die Dateien dort, landen die Ergebnisse im selben Ordner. Über „Ordner öffnen“ speichert die App direkt in den gewählten Ordner.';
+    ? `Speichern in: Ordner „${dirHandle.name}“, neben den Quelldateien.`
+    : 'Speichern im Download-Ordner des Browsers (Chrome fragt beim ersten Mal evtl. nach „Mehrere Downloads“ – bitte erlauben). Mit „Ordner öffnen“ landen die Ergebnisse direkt neben den Dateien.';
 }
 
 function fmtSize(b) { return b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'; }
@@ -45,7 +52,7 @@ function renderList() {
     const li = document.createElement('li');
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.checked = e.checked; cb.id = 'f' + e.id;
-    cb.onchange = () => { e.checked = cb.checked; syncSelAll(); };
+    cb.onchange = () => { e.checked = cb.checked; saved.delete(e.id); scheduleAnalyze(); };
     const nm = document.createElement('label'); nm.className = 'nm'; nm.htmlFor = cb.id; nm.textContent = e.name;
     const meta = document.createElement('span'); meta.className = 'meta';
     meta.textContent = `${fmtSize(e.size)}${e.modified ? ' · ' + new Date(e.modified).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' }) : ''}`;
@@ -53,11 +60,10 @@ function renderList() {
     ul.append(li);
   }
   const has = entries.length > 0;
-  $('listCard').hidden = !has; $('setCard').hidden = !has; $('runCard').hidden = !has;
-  syncSelAll();
+  // Bei einer einzelnen Datei braucht es keine Liste
+  $('listCard').hidden = entries.length < 2;
+  $('setCard').hidden = !has; $('resultsWrap').hidden = !has;
 }
-function syncSelAll() { $('selAll').checked = entries.length > 0 && entries.every((e) => e.checked); }
-$('selAll').onchange = (ev) => { entries.forEach((e) => (e.checked = ev.target.checked)); renderList(); };
 
 const pdfTypes = [{ description: 'PDF und Bilder', accept: { 'application/pdf': ['.pdf'], 'image/*': ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'] } }];
 const entryOf = (f) => ({ name: f.name, size: f.size, modified: f.lastModified, getFile: async () => f });
@@ -92,7 +98,8 @@ $('btnDir').onclick = async () => {
     }
     list.sort((a, b) => b.modified - a.modified);
     if (!list.length) { $('outHint').textContent = `Im Ordner „${dir.name}“ liegen keine PDFs oder Bilder.`; return; }
-    setEntries(list, dir);
+    // Nur die neueste Datei ist vorgewählt (typisch: der gerade aufgenommene Screenshot)
+    setEntries(list, dir, (i) => i === 0);
   } catch (err) {
     if (err && err.name === 'AbortError') return;
     $('outHint').textContent = 'Der Browser erlaubt diesen Ordner nicht (Chrome sperrt z. B. den Download-Ordner selbst als Ordnerauswahl). Nutze „Dateien wählen“ – die Ergebnisse landen dann im Download-Ordner.';
@@ -108,10 +115,9 @@ function addClipboardImage(blob) {
   const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
   const f = new File([blob], `${stamp()}.${ext}`, { type: blob.type, lastModified: Date.now() });
   entries.forEach((e) => (e.checked = false));
-  entries.push({ ...entryOf(f), id: entries.length, checked: true });
-  renderList();
-  updateHint();
-  if (!running) $('btnRun').click(); // Einfügen = sofort umwandeln
+  entries.push({ ...entryOf(f), id: nextId++, checked: true });
+  saved.clear();
+  renderList(); updateHint(); scheduleAnalyze();
 }
 document.addEventListener('paste', (ev) => {
   const items = [...(ev.clipboardData?.items || [])].filter((i) => i.kind === 'file' && i.type.startsWith('image/'));
@@ -140,19 +146,35 @@ addEventListener('drop', (ev) => {
 // ---------- Einstellungen ----------
 function settings() {
   return {
-    gridCut: +$('gridCut').value, gap: +$('gap').value, minSize: +$('minSize').value,
-    photos: true, drawings: $('optMode').value === 'alles', images: $('optMode').value === 'bilder',
-    ocr: $('optOcr').checked, lang: $('ocrLang').value, outline: $('optOutline').checked, conf: $('optConf').checked,
+    gridCut: +$('gridCut').value, gap: +$('gap').value, minSize: +$('minSize').value, mode,
+    photos: true, drawings: mode === 'alles', images: mode === 'bilder',
+    ocr: $('optOcr').checked, lang: $('ocrLang').value, outline: $('optOutline').checked, clean: $('optClean').checked,
   };
 }
+const geomSig = (st) => [st.gridCut, st.gap, st.minSize, st.mode].join('|');
 function syncOut() {
   $('oCut').textContent = (+$('gridCut').value).toFixed(2);
   $('oGap').textContent = $('gap').value + ' px';
   $('oMin').textContent = $('minSize').value + ' px';
+  $('modeHint').textContent = mode === 'bilder'
+    ? 'Fotos und Illustrationen werden freigestellt, Text bleibt Text (OCR).'
+    : 'Auch Handschrift, Striche und Textblöcke werden als Bilder übernommen – für Notizen.';
 }
-['gridCut', 'gap', 'minSize'].forEach((id) => $(id).addEventListener('input', syncOut));
-// Bilder-Modus braucht einen kleinen Abstand, damit Bildunterschriften nicht mit der Figur verschmelzen
-$('optMode').addEventListener('change', () => { $('gap').value = $('optMode').value === 'bilder' ? 12 : 50; syncOut(); });
+['gridCut', 'gap', 'minSize'].forEach((id) => $(id).addEventListener('input', () => {
+  if (id === 'gap') gapTouched = true;
+  syncOut(); scheduleAnalyze(450);
+}));
+function setMode(m) {
+  mode = m;
+  $('modeBilder').setAttribute('aria-pressed', String(m === 'bilder'));
+  $('modeAlles').setAttribute('aria-pressed', String(m === 'alles'));
+  // Passender Zusammenfass-Abstand, solange der Regler nicht von Hand verstellt wurde
+  if (!gapTouched) $('gap').value = m === 'bilder' ? 12 : 50;
+  syncOut(); scheduleAnalyze();
+}
+$('modeBilder').onclick = () => setMode('bilder');
+$('modeAlles').onclick = () => setMode('alles');
+['optOcr', 'ocrLang', 'optOutline', 'optClean'].forEach((id) => $(id).addEventListener('change', () => { saved.clear(); renderResults(); }));
 syncOut();
 
 // ---------- Hilfsfunktionen: Canvas / Speichern ----------
@@ -216,13 +238,13 @@ async function recognize(canvas, st, status) {
     }
     data = (await ocrWorker.recognize(canvas)).data;
   }
-  let lines = linesOf(data);
-  if (st.conf) lines = lines.filter((l) => l.conf >= 50 && /[\p{L}\p{N}].*[\p{L}\p{N}]/u.test(l.text));
-  return lines.map((l) => l.text).filter((t) => t.trim()).join('\n');
+  const lines = linesOf(data);
+  return (st.clean ? cleanOcrLines(lines) : lines.map((l) => l.text).filter((t) => t.trim())).join('\n');
 }
 
 // ---------- Verarbeitung ----------
-async function processFile(entry, st, onProgress, status) {
+// save=false: nur analysieren (Vorschau). save=true: erneut rechnen, OCR und Dateien schreiben.
+async function processFile(entry, st, { save, status }) {
   const file = await entry.getFile();
   const isImg = isImageName(entry.name);
   let task = null, doc = null, total = 1;
@@ -231,16 +253,16 @@ async function processFile(entry, st, onProgress, status) {
     doc = await task.promise;
     total = doc.numPages;
   }
-  const pagesOut = [], ocrPages = [], thumbs = [];
-  let figTotal = 0, nPhotos = 0;
+  const pagesOut = [], ocrPages = [], thumbs = [], warnings = [];
+  let figTotal = 0, nPhotos = 0, ocrError = null;
   try {
     for (let n = 1; n <= total; n++) {
-      onProgress((n - 1) / total, `Seite ${n}/${total}: laden …`);
+      status(`${entry.name}: Seite ${n}/${total} …`);
       let page = null, canvas, w, h, k = 1;
       if (isImg) {
         // Bilddatei (Screenshot): Originalauflösung, Größen-Regler auf die Bildbreite umrechnen
         const bmp = await createImageBitmap(file);
-        let sc = Math.min(1, Math.sqrt(28e6 / (bmp.width * bmp.height)));
+        const sc = Math.min(1, Math.sqrt(28e6 / (bmp.width * bmp.height)));
         w = Math.max(1, Math.round(bmp.width * sc)); h = Math.max(1, Math.round(bmp.height * sc));
         canvas = mkCanvas(w, h);
         const c0 = canvas.getContext('2d');
@@ -257,10 +279,7 @@ async function processFile(entry, st, onProgress, status) {
         canvas = mkCanvas(w, h);
         await page.render({ canvas, viewport: vp, background: '#ffffff' }).promise;
       }
-      const ctx = canvas.getContext('2d');
-      const rgba = ctx.getImageData(0, 0, w, h).data;
-
-      status(`Seite ${n}/${total}: Raster entfernen, Zeichnungen suchen …`);
+      const rgba = canvas.getContext('2d').getImageData(0, 0, w, h).data;
       await new Promise((r) => setTimeout(r)); // UI atmen lassen
       const bg = estimateBackground(rgba);
       const { ink, count } = extractInk(rgba, bg, st.gridCut);
@@ -270,140 +289,182 @@ async function processFile(entry, st, onProgress, status) {
         photos: st.photos, drawings: st.drawings, images: st.images,
       });
       figTotal += figs.length;
+      nPhotos += figs.filter((f) => f.kind !== 'drawing').length;
 
       const figsOut = [];
-      const photoCanvases = new Map();
-      const canvasForPreview = (f) => photoCanvases.get(f);
+      const figCanvas = new Map();
       for (const f of figs) {
         const c = mkCanvas(f.w, f.h);
-        if (f.kind !== 'drawing') photoCanvases.set(f, c);
         c.getContext('2d').putImageData(new ImageData(f.rgba, f.w, f.h), 0, 0);
-        const isPhoto = f.kind === 'photo'; // Fotos: JPEG-Rechteck; Zeichnungen/freigestellte Bilder: PNG mit Transparenz
-        const mime = isPhoto ? 'image/jpeg' : 'image/png';
-        const dataURL = bytesToDataURL(await toBytes(c, mime), mime);
-        figsOut.push({ x: f.x, y: f.y, w: f.w, h: f.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
-        if (f.kind !== 'drawing') nPhotos++;
+        figCanvas.set(f, c);
+        if (save) {
+          const mime = f.kind === 'photo' ? 'image/jpeg' : 'image/png'; // Fotos JPEG-Rechteck, sonst PNG mit Transparenz
+          const dataURL = bytesToDataURL(await toBytes(c, mime), mime);
+          figsOut.push({ x: f.x, y: f.y, w: f.w, h: f.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
+        }
         f.rgba = null;
       }
-      pagesOut.push({ width: w, height: h, figures: figsOut });
+      if (save) pagesOut.push({ width: w, height: h, figures: figsOut });
 
-      // Ink-only-Canvas (weiß hinterlegt) für OCR und Vorschau
+      // Seite ohne Raster, weiß hinterlegt: für OCR und Vorschau
       const inkCanvas = mkCanvas(w, h);
       inkCanvas.getContext('2d').putImageData(new ImageData(ink, w, h), 0, 0);
       const flat = mkCanvas(w, h);
       const fctx = flat.getContext('2d');
       fctx.fillStyle = '#fff'; fctx.fillRect(0, 0, w, h); fctx.drawImage(inkCanvas, 0, 0);
-      // Fotos für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
-      if (st.ocr) for (const f of figs) if (f.kind !== 'drawing') fctx.fillRect(f.x, f.y, f.w, f.h);
 
-      if (st.ocr) {
+      if (save && st.ocr && !ocrError) {
+        // Bilder für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
+        const ocrCanvas = mkCanvas(w, h);
+        const octx = ocrCanvas.getContext('2d');
+        octx.drawImage(flat, 0, 0);
+        octx.fillStyle = '#fff';
+        for (const f of figs) if (f.kind !== 'drawing') octx.fillRect(f.x, f.y, f.w, f.h);
         if (count >= 200) {
-          status(`Seite ${n}/${total}: OCR …`);
-          ocrPages.push({ n, text: await recognize(flat, st, status) });
+          status(`${entry.name}: Seite ${n}/${total}: Text erkennen …`);
+          try { ocrPages.push({ n, text: await recognize(ocrCanvas, st, status) }); }
+          catch (e) { ocrError = e.message || String(e); }
         } else ocrPages.push({ n, text: '' });
+        ocrCanvas.width = ocrCanvas.height = 0;
       }
 
-      // Vorschau mit nummerierten Rahmen
-      const tw = Math.min(w, 520), tk = tw / w;
-      const th = mkCanvas(tw, Math.round(h * tk));
-      const tctx = th.getContext('2d');
-      tctx.fillStyle = '#fff'; tctx.fillRect(0, 0, th.width, th.height);
-      tctx.drawImage(flat, 0, 0, th.width, th.height);
-      tctx.lineWidth = 2; tctx.font = 'bold 13px system-ui';
-      // Vorschau zeigt die Seite ohne Raster; Fotos darin in Originalfarben
-      for (const f of figs) if (f.kind !== 'drawing') tctx.drawImage(canvasForPreview(f), f.x * tk, f.y * tk, f.w * tk, f.h * tk);
-      figs.forEach((f, i) => {
-        const col = f.kind !== 'drawing' ? '#f9a73b' : '#00b5a6';
-        tctx.strokeStyle = col;
-        tctx.strokeRect(f.x * tk, f.y * tk, f.w * tk, f.h * tk);
-        tctx.fillStyle = col; tctx.fillRect(f.x * tk, f.y * tk, 22, 18);
-        tctx.fillStyle = '#04110f'; tctx.fillText(String(i + 1), f.x * tk + 5, f.y * tk + 14);
-      });
-      thumbs.push({ n, canvas: th, count: figs.length });
+      if (!save) {
+        // Vorschau mit nummerierten Rahmen
+        const tw = Math.min(w, 640), tk = tw / w;
+        const th = mkCanvas(tw, Math.round(h * tk));
+        const tctx = th.getContext('2d');
+        tctx.fillStyle = '#fff'; tctx.fillRect(0, 0, th.width, th.height);
+        tctx.drawImage(flat, 0, 0, th.width, th.height);
+        for (const f of figs) if (f.kind !== 'drawing') tctx.drawImage(figCanvas.get(f), f.x * tk, f.y * tk, f.w * tk, f.h * tk);
+        tctx.lineWidth = 2; tctx.font = 'bold 13px system-ui';
+        figs.forEach((f, i) => {
+          const col = f.kind !== 'drawing' ? '#f9a73b' : '#00b5a6';
+          tctx.strokeStyle = col;
+          tctx.strokeRect(f.x * tk, f.y * tk, f.w * tk, f.h * tk);
+          tctx.fillStyle = col; tctx.fillRect(f.x * tk, f.y * tk, 22, 18);
+          tctx.fillStyle = '#04110f'; tctx.fillText(String(i + 1), f.x * tk + 5, f.y * tk + 14);
+        });
+        thumbs.push({ n, canvas: th, count: figs.length });
+      }
       canvas.width = canvas.height = inkCanvas.width = inkCanvas.height = flat.width = flat.height = 0;
       if (page) page.cleanup();
     }
   } finally { if (task) await task.destroy(); }
 
+  const res = { figTotal, nPhotos, pages: total, thumbs, saved: [], text: '', warnings };
+  if (!save) return res;
+
   const base = entry.name.replace(/\.(pdf|png|jpe?g|bmp|gif|webp)$/i, '');
-  const saved = [];
   if (figTotal > 0) {
     const scene = buildScene(pagesOut, { outline: st.outline });
     const name = await saveBlob(base, 'excalidraw', new Blob([JSON.stringify(scene)], { type: 'application/json' }));
-    const parts = [];
-    if (nPhotos) parts.push(`${nPhotos} Bild${nPhotos === 1 ? '' : 'er'}`);
-    if (figTotal - nPhotos) parts.push(`${figTotal - nPhotos} Zeichnung/Textblock${figTotal - nPhotos === 1 ? '' : 'e'}`);
-    saved.push(`${name} – ${parts.join(' + ')}, einzeln anklickbar`);
+    res.saved.push(`${name} – ${figTotal} Element${figTotal === 1 ? '' : 'e'}, einzeln anklickbar`);
   }
-  let text = '';
   if (st.ocr) {
-    text = buildTxt(entry.name, st.lang, ocrPages);
-    const name = await saveBlob(base, 'txt', new Blob([text], { type: 'text/plain;charset=utf-8' }));
-    saved.push(`${name} – OCR-Text`);
-  }
-  return { saved, thumbs, text, figTotal, pages: total };
-}
-
-function showResult(entry, res, err) {
-  const card = document.createElement('div');
-  card.className = 'card res';
-  const h = document.createElement('h3'); h.textContent = entry.name; card.append(h);
-  const p = document.createElement('div');
-  if (err) { p.className = 'err'; p.textContent = 'Fehler: ' + (err.message || err); card.append(p); }
-  else {
-    p.className = res.figTotal || res.saved.length ? 'ok' : 'muted';
-    p.textContent = res.figTotal ? `${res.figTotal} Element(e) auf ${res.pages} Seite(n) erkannt` : 'Nichts Ausschneidbares gefunden – Schwelle/Abstand in den Einstellungen anpassen?';
-    card.append(p);
-    if (res.saved.length) {
-      const ul = document.createElement('ul');
-      for (const s of res.saved) { const li = document.createElement('li'); li.textContent = s; ul.append(li); }
-      card.append(ul);
-    }
-    const tb = document.createElement('div'); tb.className = 'thumbs';
-    for (const t of res.thumbs) {
-      const fig = document.createElement('figure');
-      fig.append(t.canvas);
-      const cap = document.createElement('figcaption'); cap.textContent = `Seite ${t.n}: ${t.count} Element(e)`;
-      fig.append(cap); tb.append(fig);
-    }
-    card.append(tb);
-    if (res.text) {
-      const d = document.createElement('details'); d.style.marginTop = '10px';
-      const s = document.createElement('summary'); s.textContent = 'Erkannten Text anzeigen'; d.append(s);
-      const pre = document.createElement('pre'); pre.textContent = res.text; pre.style.whiteSpace = 'pre-wrap'; d.append(pre);
-      card.append(d);
+    if (ocrError) warnings.push(`Text konnte nicht erkannt werden (${ocrError}). Die Bilder wurden trotzdem gespeichert.`);
+    else {
+      res.text = buildTxt(entry.name, st.lang, ocrPages);
+      const name = await saveBlob(base, 'txt', new Blob([res.text], { type: 'text/plain;charset=utf-8' }));
+      res.saved.push(`${name} – Text`);
     }
   }
-  $('results').prepend(card);
+  return res;
 }
 
-$('btnRun').onclick = async () => {
-  if (running) return;
-  const sel = entries.filter((e) => e.checked);
-  if (!sel.length) { $('runState').textContent = 'Bitte mindestens eine PDF auswählen.'; return; }
-  running = true; $('btnRun').disabled = true; $('barWrap').hidden = false;
-  $('results').textContent = '';
+// ---------- Ablauf: automatisch analysieren, dann speichern ----------
+function scheduleAnalyze(delay = 0) {
+  clearTimeout(timer);
+  const my = ++token;
+  analyzing = true;
+  renderResults();
+  timer = setTimeout(() => { chain = chain.then(() => runAnalyze(my)); }, delay);
+}
+
+async function runAnalyze(my) {
   const st = settings();
-  const status = (t) => { $('runState').textContent = t; };
-  let ok = 0;
-  for (let i = 0; i < sel.length; i++) {
-    const e = sel[i];
-    const prog = (f, t) => { $('bar').style.width = ((i + f) / sel.length * 100).toFixed(1) + '%'; if (t) status(`${e.name} (${i + 1}/${sel.length}) – ${t}`); };
+  for (const e of entries.filter((x) => x.checked)) {
+    if (my !== token) return;
+    const c = cache.get(e.id);
+    if (c && c.sig === geomSig(st)) continue;
+    e.busy = true; e.error = null; renderResults();
     try {
-      const res = await processFile(e, st, prog, (t) => status(`${e.name} (${i + 1}/${sel.length}) – ${t}`));
-      showResult(e, res); ok++;
-    } catch (err) {
-      console.error(err);
-      showResult(e, null, err);
-    }
-    $('bar').style.width = ((i + 1) / sel.length * 100).toFixed(1) + '%';
+      const res = await processFile(e, st, { save: false, status: (t) => { $('runState').textContent = t; } });
+      if (my !== token) { e.busy = false; return; }
+      cache.set(e.id, { sig: geomSig(st), res });
+    } catch (err) { console.error(err); e.error = err.message || String(err); cache.delete(e.id); }
+    e.busy = false;
+    renderResults();
+  }
+  if (my === token) { analyzing = false; $('runState').textContent = ''; renderResults(); }
+}
+
+$('btnSave').onclick = async () => {
+  if (saving || analyzing) return;
+  saving = true; renderResults();
+  const st = settings();
+  for (const e of entries.filter((x) => x.checked && cache.has(x.id))) {
+    e.busy = true; renderResults();
+    try { saved.set(e.id, await processFile(e, st, { save: true, status: (t) => { $('runState').textContent = t; } })); }
+    catch (err) { console.error(err); saved.set(e.id, { error: err.message || String(err), saved: [], warnings: [], thumbs: [] }); }
+    e.busy = false;
   }
   await closeOcr();
-  status(`Fertig: ${ok} von ${sel.length} Datei(en) umgewandelt.`);
-  running = false; $('btnRun').disabled = false;
+  saving = false; $('runState').textContent = '';
+  renderResults();
   window.__aoDone = true;
 };
 
+function renderResults() {
+  const box = $('results');
+  box.textContent = '';
+  const sel = entries.filter((e) => e.checked);
+  let ready = 0, done = 0;
+  for (const e of sel) {
+    const c = cache.get(e.id), s = saved.get(e.id);
+    if (c) ready++;
+    if (s && !s.error) done++;
+    const card = document.createElement('div'); card.className = 'card res';
+    const h = document.createElement('h3'); h.textContent = e.name; card.append(h);
+    const p = document.createElement('div'); card.append(p);
+    if (e.error) { p.className = 'err'; p.textContent = 'Fehler: ' + e.error; }
+    else if (e.busy && !c) { p.className = 'muted'; p.textContent = 'Wird analysiert …'; }
+    else if (c) {
+      const r = c.res;
+      p.className = r.figTotal ? 'ok' : 'muted';
+      p.textContent = r.figTotal
+        ? `${r.figTotal} Element${r.figTotal === 1 ? '' : 'e'} erkannt${r.pages > 1 ? ` auf ${r.pages} Seiten` : ''}`
+        : 'Nichts Ausschneidbares gefunden – unter „Erweitert“ lässt sich das anpassen.';
+      if (s) {
+        const ul = document.createElement('ul');
+        for (const t of s.saved || []) { const li = document.createElement('li'); li.textContent = '✓ ' + t; ul.append(li); }
+        for (const t of [...(s.warnings || []), ...(s.error ? [s.error] : [])]) { const li = document.createElement('li'); li.className = 'warn'; li.textContent = t; ul.append(li); }
+        card.append(ul);
+      }
+      const tb = document.createElement('div'); tb.className = 'thumbs';
+      for (const t of r.thumbs) {
+        const fig = document.createElement('figure');
+        fig.append(t.canvas);
+        const cap = document.createElement('figcaption'); cap.textContent = r.pages > 1 ? `Seite ${t.n}: ${t.count} Element(e)` : `${t.count} Element(e)`;
+        fig.append(cap); tb.append(fig);
+      }
+      card.append(tb);
+      if (s && s.text) {
+        const d = document.createElement('details'); d.style.marginTop = '10px';
+        const sm = document.createElement('summary'); sm.textContent = 'Erkannten Text anzeigen'; d.append(sm);
+        const pre = document.createElement('pre'); pre.textContent = s.text; pre.style.whiteSpace = 'pre-wrap'; d.append(pre);
+        card.append(d);
+      }
+    }
+    box.append(card);
+  }
+  const b = $('btnSave');
+  const allDone = ready > 0 && done === ready;
+  b.disabled = analyzing || saving || ready === 0 || allDone;
+  b.textContent = saving ? 'Speichere …' : analyzing ? 'Analysiere …' : allDone ? 'Gespeichert ✓' : `Speichern${ready > 1 ? ` (${ready} Dateien)` : ''}`;
+  $('openHint').hidden = done === 0;
+}
+
+// ---------- Aktualisieren / Start ----------
 $('ver').textContent = 'Version ' + APP_VERSION;
 $('btnUpdate').onclick = async () => {
   $('btnUpdate').disabled = true; $('btnUpdate').textContent = 'Aktualisiere …';

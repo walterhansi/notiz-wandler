@@ -430,3 +430,36 @@ export async function uniqueName(base, ext, exists) {
   while (await exists(cand)) { n++; cand = `${base} (${n}).${ext}`; }
   return cand;
 }
+
+// ---------- OCR-Text bereinigen ----------
+
+/**
+ * Macht aus OCR-Zeilen {text, conf} reinen Text: unsichere Zeilen (Konfidenz < minConf) und
+ * Zeilen, die überwiegend aus Sonderzeichen bestehen, entfallen; verstreute Sonderzeichen werden entfernt;
+ * Aufzählungszeichen am Zeilenanfang (•, ·, *, -, ○ … oder ein als e/o/c verlesener Punkt) werden zu "- ".
+ */
+export function cleanOcrLines(lines, { minConf = 60 } = {}) {
+  const out = [];
+  const L = /[\p{L}\p{N}]/u;
+  for (const l of lines) {
+    if ((l.conf ?? 100) < minConf) continue;
+    let t = String(l.text || '').replace(/\s+/g, ' ').trim();
+    if (!t) continue;
+    let bullet = false;
+    const m = t.match(/^([^\p{L}\p{N}\s]{1,3})\s*/u);
+    // Führende Symbole sind Aufzählungszeichen (auch fehlgelesene wie © oder ®); öffnende Anführungszeichen/Klammern bleiben Text
+    if (m && !/^[„“"'(\[¿¡]/.test(m[1])) { bullet = true; t = t.slice(m[0].length); }
+    // Punkt als einzelner Buchstabe verlesen ("e Stehe aufrecht")
+    const m2 = t.match(/^[eoc©®](\s+)(?=\p{L}\S*\s+\S)/u);
+    if (m2 && !bullet) { bullet = true; t = t.slice(m2[0].length); }
+    const words = t.split(' ')
+      .map((w) => w.replace(/[^\p{L}\p{N}.,;:!?()\-–„“"'’\/%&+€]/gu, ''))
+      .filter((w) => L.test(w));
+    t = words.join(' ');
+    const alnum = (t.match(/[\p{L}\p{N}]/gu) || []).length;
+    if (alnum < 2) continue;
+    if (words.length >= 3 && alnum / words.length < 2) continue; // lauter Einzelzeichen = Rauschen
+    out.push((bullet ? '- ' : '') + t);
+  }
+  return out;
+}
