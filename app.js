@@ -11,7 +11,7 @@ const PDF_OPTS = {
   isEvalSupported: false,
 };
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const APP_VERSION = '1.2';
+const APP_VERSION = '1.3';
 const PAGE_W = 1600; // Zielbreite beim Rendern (px)
 
 const $ = (id) => document.getElementById(id);
@@ -99,7 +99,7 @@ $('btnDir').onclick = async () => {
 function settings() {
   return {
     gridCut: +$('gridCut').value, gap: +$('gap').value, minSize: +$('minSize').value,
-    photos: $('optPhotos').checked, drawings: $('optDrawings').checked,
+    photos: true, drawings: $('optMode').value === 'alles', images: $('optMode').value === 'bilder',
     ocr: $('optOcr').checked, lang: $('ocrLang').value, outline: $('optOutline').checked, conf: $('optConf').checked,
   };
 }
@@ -109,6 +109,8 @@ function syncOut() {
   $('oMin').textContent = $('minSize').value + ' px';
 }
 ['gridCut', 'gap', 'minSize'].forEach((id) => $(id).addEventListener('input', syncOut));
+// Bilder-Modus braucht einen kleinen Abstand, damit Bildunterschriften nicht mit der Figur verschmelzen
+$('optMode').addEventListener('change', () => { $('gap').value = $('optMode').value === 'bilder' ? 12 : 50; syncOut(); });
 syncOut();
 
 // ---------- Hilfsfunktionen: Canvas / Speichern ----------
@@ -203,7 +205,7 @@ async function processFile(entry, st, onProgress, status) {
       await new Promise((r) => setTimeout(r)); // UI atmen lassen
       const bg = estimateBackground(rgba);
       const { ink, count } = extractInk(rgba, bg, st.gridCut);
-      const figs = segmentAll(rgba, ink, w, h, { gap: st.gap, minSize: st.minSize, photos: st.photos, drawings: st.drawings });
+      const figs = segmentAll(rgba, ink, w, h, { gap: st.gap, minSize: st.minSize, photos: st.photos, drawings: st.drawings, images: st.images });
       figTotal += figs.length;
 
       const figsOut = [];
@@ -211,13 +213,13 @@ async function processFile(entry, st, onProgress, status) {
       const canvasForPreview = (f) => photoCanvases.get(f);
       for (const f of figs) {
         const c = mkCanvas(f.w, f.h);
-        if (f.kind === 'photo') photoCanvases.set(f, c);
+        if (f.kind !== 'drawing') photoCanvases.set(f, c);
         c.getContext('2d').putImageData(new ImageData(f.rgba, f.w, f.h), 0, 0);
-        const isPhoto = f.kind === 'photo';
+        const isPhoto = f.kind === 'photo'; // Fotos: JPEG-Rechteck; Zeichnungen/freigestellte Bilder: PNG mit Transparenz
         const mime = isPhoto ? 'image/jpeg' : 'image/png';
         const dataURL = bytesToDataURL(await toBytes(c, mime), mime);
         figsOut.push({ x: f.x, y: f.y, w: f.w, h: f.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
-        if (isPhoto) nPhotos++;
+        if (f.kind !== 'drawing') nPhotos++;
         f.rgba = null;
       }
       pagesOut.push({ width: w, height: h, figures: figsOut });
@@ -229,7 +231,7 @@ async function processFile(entry, st, onProgress, status) {
       const fctx = flat.getContext('2d');
       fctx.fillStyle = '#fff'; fctx.fillRect(0, 0, w, h); fctx.drawImage(inkCanvas, 0, 0);
       // Fotos für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
-      if (st.ocr) for (const f of figs) if (f.kind === 'photo') fctx.fillRect(f.x, f.y, f.w, f.h);
+      if (st.ocr) for (const f of figs) if (f.kind !== 'drawing') fctx.fillRect(f.x, f.y, f.w, f.h);
 
       if (st.ocr) {
         if (count >= 200) {
@@ -246,9 +248,9 @@ async function processFile(entry, st, onProgress, status) {
       tctx.drawImage(flat, 0, 0, th.width, th.height);
       tctx.lineWidth = 2; tctx.font = 'bold 13px system-ui';
       // Vorschau zeigt die Seite ohne Raster; Fotos darin in Originalfarben
-      for (const f of figs) if (f.kind === 'photo') tctx.drawImage(canvasForPreview(f), f.x * k, f.y * k, f.w * k, f.h * k);
+      for (const f of figs) if (f.kind !== 'drawing') tctx.drawImage(canvasForPreview(f), f.x * k, f.y * k, f.w * k, f.h * k);
       figs.forEach((f, i) => {
-        const col = f.kind === 'photo' ? '#f9a73b' : '#00b5a6';
+        const col = f.kind !== 'drawing' ? '#f9a73b' : '#00b5a6';
         tctx.strokeStyle = col;
         tctx.strokeRect(f.x * k, f.y * k, f.w * k, f.h * k);
         tctx.fillStyle = col; tctx.fillRect(f.x * k, f.y * k, 22, 18);
@@ -266,7 +268,7 @@ async function processFile(entry, st, onProgress, status) {
     const scene = buildScene(pagesOut, { outline: st.outline });
     const name = await saveBlob(base, 'excalidraw', new Blob([JSON.stringify(scene)], { type: 'application/json' }));
     const parts = [];
-    if (nPhotos) parts.push(`${nPhotos} Foto${nPhotos === 1 ? '' : 's'}`);
+    if (nPhotos) parts.push(`${nPhotos} Bild${nPhotos === 1 ? '' : 'er'}`);
     if (figTotal - nPhotos) parts.push(`${figTotal - nPhotos} Zeichnung/Textblock${figTotal - nPhotos === 1 ? '' : 'e'}`);
     saved.push(`${name} – ${parts.join(' + ')}, einzeln anklickbar`);
   }

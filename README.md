@@ -3,7 +3,7 @@
 Wandelt Notiz-PDFs (z. B. aus Huawei Notizen via PairDrop) um:
 
 * **Raster entfernen** und jede einzeln abgrenzbare Zeichnung als **eigenes, anklickbares Bild-Element** in eine `.excalidraw`-Datei übernehmen (Name wie die PDF).
-* **Fotos** (flächige Bilder, z. B. Übungsfotos A/B/C) werden als Rechteck in Originalfarben einzeln übernommen, sofern sie durch freien Rand getrennt sind. Beide Funktionen lassen sich einzeln abschalten.
+* **Fotos** (flächige Bilder, z. B. Übungsfotos A/B/C) werden als Rechteck in Originalfarben einzeln übernommen, sofern sie durch freien Rand getrennt sind. Im Modus **„Nur Bilder (freigestellt)“** werden Personen/Illustrationen mit voller Kernfläche ohne Hintergrund ausgeschnitten, Text wird ignoriert (und nur per OCR in die `.txt` übernommen).
 * **OCR-Text** in eine `.txt`-Datei (gleicher Name, `Seite n`-Abschnitte).
 
 ## Benutzung

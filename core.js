@@ -13,6 +13,9 @@ export const DEFAULTS = {
   drawings: true,   // übrige Striche/Zeichnungen/Text gruppieren und ausschneiden
   solid: 16,        // Fotos: Mindestdicke einer 'vollen' Fläche (px); dünne Striche zählen nicht
   minPhoto: 80,     // Fotos: kleinste Kantenlänge (px)
+  photoFill: 0.85,  // Foto = volle Fläche; darunter (z. B. Person mit Hintergrund) gilt als Bild mit Kontur
+  images: false,    // Modus 'Nur Bilder': Gruppen mit voller Kernfläche freigestellt übernehmen, Text ignorieren
+  minCore: 1000,    // Bild: mindestens so viele Pixel in voller Kernfläche
 };
 
 /** Häufigste Farbe der Seite = Papier. */
@@ -34,10 +37,10 @@ export function estimateBackground(rgba) {
   return [sum[best * 3] / c, sum[best * 3 + 1] / c, sum[best * 3 + 2] / c].map(Math.round);
 }
 
-function ca(c, b) { // color-to-alpha für einen Kanal
-  if (c < b) return (b - c) / b;
-  if (c > b) return (c - b) / (255 - b);
-  return 0;
+function ca(c, b, light) { // color-to-alpha für einen Kanal; Richtung nach Papierhelligkeit
+  // Helles Papier: nur Dunkleres ist Tinte (JPEG-Rauschen/leichtes Überweiß zählt nicht). Dunkles Papier: umgekehrt.
+  if (light) return c < b ? (b - c) / b : 0;
+  return c > b ? (c - b) / (255 - b) : 0;
 }
 
 /**
@@ -48,10 +51,11 @@ function ca(c, b) { // color-to-alpha für einen Kanal
 export function extractInk(rgba, bg, cut) {
   const out = new Uint8ClampedArray(rgba.length);
   const [br, bgg, bb] = bg;
+  const light = (br + bgg + bb) / 3 > 127;
   let count = 0;
   for (let i = 0; i < rgba.length; i += 4) {
     const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
-    const a = Math.max(ca(r, br), ca(g, bgg), ca(b, bb));
+    const a = Math.max(ca(r, br, light), ca(g, bgg, light), ca(b, bb, light));
     if (a < cut) continue;
     out[i] = (r - br) / a + br;
     out[i + 1] = (g - bgg) / a + bgg;
@@ -245,7 +249,7 @@ export function findPhotos(ink, w, h, opts = {}) {
   for (let l = 1; l <= n; l++) {
     if (!px[l]) continue;
     const bw = x1[l] - x0[l] + 1, bh = y1[l] - y0[l] + 1;
-    if (Math.min(bw, bh) < o.minPhoto || px[l] < 0.4 * bw * bh) continue;
+    if (Math.min(bw, bh) < o.minPhoto || px[l] < o.photoFill * bw * bh) continue;
     keep[l] = 1;
     photos.push({ kind: 'photo', x: x0[l], y: y0[l], w: bw, h: bh, pixels: px[l] });
   }
@@ -259,7 +263,30 @@ export function findPhotos(ink, w, h, opts = {}) {
       for (let y = ya; y < yb; y++) for (let x = xa; x < xb; x++) rest[(y * w + x) * 4 + 3] = 0;
     }
   }
-  return { photos, rest };
+  // Kernflächen der übrigen (nicht rechteckigen) Bilder, Zellraster
+  const core = new Uint8Array(cw * ch);
+  for (let i = 0; i < core.length; i++) { const l = label[i]; if (l && !keep[l]) core[i] = 1; }
+  return { photos, rest, core, C, cw };
+}
+
+// Löcher im Bild (helle Stellen, die als transparent galten) mit Originalfarbe füllen: Freistellung ohne Löcher.
+function fillHoles(it, src, w) {
+  const { w: cw, h: ch, rgba } = it;
+  const out = new Uint8Array(cw * ch);
+  const stack = [];
+  const push = (x, y) => { const k = y * cw + x; if (!out[k] && !rgba[k * 4 + 3]) { out[k] = 1; stack.push(k); } };
+  for (let x = 0; x < cw; x++) { push(x, 0); push(x, ch - 1); }
+  for (let y = 0; y < ch; y++) { push(0, y); push(cw - 1, y); }
+  while (stack.length) {
+    const k = stack.pop(); const x = k % cw, y = (k / cw) | 0;
+    if (x > 0) push(x - 1, y); if (x < cw - 1) push(x + 1, y);
+    if (y > 0) push(x, y - 1); if (y < ch - 1) push(x, y + 1);
+  }
+  for (let k = 0; k < cw * ch; k++) {
+    if (out[k] || rgba[k * 4 + 3]) continue;
+    const si = ((it.y + ((k / cw) | 0)) * w + it.x + (k % cw)) * 4;
+    rgba[k * 4] = src[si]; rgba[k * 4 + 1] = src[si + 1]; rgba[k * 4 + 2] = src[si + 2]; rgba[k * 4 + 3] = 255;
+  }
 }
 
 function cropOpaque(src, w, x, y, cwid, chei) {
@@ -275,11 +302,24 @@ function cropOpaque(src, w, x, y, cwid, chei) {
 /** Fotos als Rechtecke (Originalfarben) + übrige Zeichnungen/Text gruppiert, gemeinsame Lesereihenfolge. */
 export function segmentAll(src, ink, w, h, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
-  let photos = [], rest = ink;
-  if (o.photos) ({ photos, rest } = findPhotos(ink, w, h, o));
+  let photos = [], rest = ink, core = null, C = 4, ccw = 0;
+  if (o.photos || o.images) ({ photos, rest, core, C, cw: ccw } = findPhotos(ink, w, h, o));
+  if (!o.photos) { photos = []; rest = ink; }
   for (const p of photos) p.rgba = cropOpaque(src, w, p.x, p.y, p.w, p.h);
-  const drawings = o.drawings ? segment(rest, w, h, o).map((d) => ({ ...d, kind: 'drawing' })) : [];
-  return readingOrder([...photos, ...drawings]);
+  let others = [];
+  if (o.drawings) others = segment(rest, w, h, o).map((d) => ({ ...d, kind: 'drawing' }));
+  else if (o.images && core) {
+    for (const d of segment(rest, w, h, o)) {
+      let n = 0;
+      for (let y = 0; y < d.h; y++) for (let x = 0; x < d.w; x++) {
+        if (d.rgba[(y * d.w + x) * 4 + 3] && core[(((d.y + y) / C) | 0) * ccw + (((d.x + x) / C) | 0)]) n++;
+      }
+      if (n < o.minCore) continue;
+      fillHoles(d, src, w);
+      others.push({ ...d, kind: 'image' });
+    }
+  }
+  return readingOrder([...photos, ...others]);
 }
 
 /** Zeilenweise von oben nach unten, innerhalb der Zeile von links nach rechts. */
