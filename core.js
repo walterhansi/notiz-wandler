@@ -441,11 +441,17 @@ export async function uniqueName(base, ext, exists) {
 export function cleanOcrLines(lines, { minConf = 60 } = {}) {
   const out = [];
   const L = /[\p{L}\p{N}]/u;
+  let prevMarker = null;
   for (const l of lines) {
     if ((l.conf ?? 100) < minConf) continue;
     let t = String(l.text || '').replace(/\s+/g, ' ').trim();
     if (!t) continue;
     let bullet = false;
+    // Buchstaben-Aufzählung "A. … B. … C. …": ein führendes © / ® ist hier ein verlesenes "C", kein Aufzählungspunkt
+    const lm = t.match(/^[©®]\s*([.)])\s*/u);
+    if (lm || (prevMarker === 'B' && /^[©®]\s/u.test(t))) { t = 'C. ' + t.slice((lm ? lm[0] : t.match(/^[©®]\s*/u)[0]).length); }
+    const mk = t.match(/^([A-Za-z])[.)]\s/);
+    prevMarker = mk ? mk[1].toUpperCase() : null;
     const m = t.match(/^([^\p{L}\p{N}\s]{1,3})\s*/u);
     // Führende Symbole sind Aufzählungszeichen (auch fehlgelesene wie © oder ®); öffnende Anführungszeichen/Klammern bleiben Text
     if (m && !/^[„“"'(\[¿¡]/.test(m[1])) { bullet = true; t = t.slice(m[0].length); }

@@ -63,3 +63,9 @@ details.adv .grid{margin-top:12px}
 .res .warn{color:var(--accent-warn,#f9a73b)}
 #resultsWrap{display:grid;gap:14px}
 .thumbs canvas{width:min(420px,92vw)}
+
+/* v1.6 Editor */
+.editor{margin-top:10px}
+.edcanvas{display:block;width:100%;max-width:900px;height:auto;border:1px solid var(--line);border-radius:8px;background:#fff;touch-action:none;cursor:crosshair}
+.edbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+button.small{min-height:36px;padding:6px 12px;font-size:.9rem}

@@ -11,7 +11,7 @@ const PDF_OPTS = {
   isEvalSupported: false,
 };
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const APP_VERSION = '1.5';
+const APP_VERSION = '1.6';
 const PAGE_W = 1600; // Zielbreite beim Rendern (px)
 
 const $ = (id) => document.getElementById(id);
@@ -162,15 +162,16 @@ function syncOut() {
 }
 ['gridCut', 'gap', 'minSize'].forEach((id) => $(id).addEventListener('input', () => {
   if (id === 'gap') gapTouched = true;
-  syncOut(); scheduleAnalyze(450);
+  syncOut(); resetEdits(); scheduleAnalyze(450);
 }));
+function resetEdits() { for (const e of entries) { delete e.edits; delete e.sel; } saved.clear(); }
 function setMode(m) {
   mode = m;
   $('modeBilder').setAttribute('aria-pressed', String(m === 'bilder'));
   $('modeAlles').setAttribute('aria-pressed', String(m === 'alles'));
   // Passender Zusammenfass-Abstand, solange der Regler nicht von Hand verstellt wurde
   if (!gapTouched) $('gap').value = m === 'bilder' ? 12 : 50;
-  syncOut(); scheduleAnalyze();
+  syncOut(); resetEdits(); scheduleAnalyze();
 }
 $('modeBilder').onclick = () => setMode('bilder');
 $('modeAlles').onclick = () => setMode('alles');
@@ -243,7 +244,15 @@ async function recognize(canvas, st, status) {
 }
 
 // ---------- Verarbeitung ----------
-// save=false: nur analysieren (Vorschau). save=true: erneut rechnen, OCR und Dateien schreiben.
+// Elemente einer Seite = Gruppen von Basis-Figuren. Ohne manuelle Änderung ist jede Figur ihre eigene Gruppe.
+const groupsOf = (entry, n, baseLen) => entry.edits?.[n] ?? Array.from({ length: baseLen }, (_, i) => [i]);
+const unionBox = (base, g) => {
+  const x0 = Math.min(...g.map((i) => base[i].x)), y0 = Math.min(...g.map((i) => base[i].y));
+  const x1 = Math.max(...g.map((i) => base[i].x + base[i].w)), y1 = Math.max(...g.map((i) => base[i].y + base[i].h));
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+};
+
+// save=false: nur analysieren (Vorschau). save=true: erneut rechnen, manuelle Auswahl anwenden, OCR und Dateien schreiben.
 async function processFile(entry, st, { save, status }) {
   const file = await entry.getFile();
   const isImg = isImageName(entry.name);
@@ -253,8 +262,8 @@ async function processFile(entry, st, { save, status }) {
     doc = await task.promise;
     total = doc.numPages;
   }
-  const pagesOut = [], ocrPages = [], thumbs = [], warnings = [];
-  let figTotal = 0, nPhotos = 0, ocrError = null;
+  const pagesOut = [], ocrPages = [], pageRes = [], warnings = [];
+  let elTotal = 0, ocrError = null;
   try {
     for (let n = 1; n <= total; n++) {
       status(`${entry.name}: Seite ${n}/${total} …`);
@@ -288,77 +297,78 @@ async function processFile(entry, st, { save, status }) {
         solid: DEFAULTS.solid * k, minPhoto: DEFAULTS.minPhoto * k, minCore: DEFAULTS.minCore * k * k,
         photos: st.photos, drawings: st.drawings, images: st.images,
       });
-      figTotal += figs.length;
-      nPhotos += figs.filter((f) => f.kind !== 'drawing').length;
-
-      const figsOut = [];
-      const figCanvas = new Map();
-      for (const f of figs) {
+      // Basis-Figuren als Canvas halten (für Zusammenfügen); rgba freigeben
+      const base = figs.map((f) => {
         const c = mkCanvas(f.w, f.h);
         c.getContext('2d').putImageData(new ImageData(f.rgba, f.w, f.h), 0, 0);
-        figCanvas.set(f, c);
-        if (save) {
-          const mime = f.kind === 'photo' ? 'image/jpeg' : 'image/png'; // Fotos JPEG-Rechteck, sonst PNG mit Transparenz
-          const dataURL = bytesToDataURL(await toBytes(c, mime), mime);
-          figsOut.push({ x: f.x, y: f.y, w: f.w, h: f.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
-        }
         f.rgba = null;
-      }
-      if (save) pagesOut.push({ width: w, height: h, figures: figsOut });
+        return { x: f.x, y: f.y, w: f.w, h: f.h, kind: f.kind, canvas: c };
+      });
+      const groups = groupsOf(entry, n, base.length);
+      elTotal += groups.length;
 
-      // Seite ohne Raster, weiß hinterlegt: für OCR und Vorschau
+      // Seite ohne Raster, weiß hinterlegt (inkl. Bilder in Originalfarben)
       const inkCanvas = mkCanvas(w, h);
       inkCanvas.getContext('2d').putImageData(new ImageData(ink, w, h), 0, 0);
       const flat = mkCanvas(w, h);
       const fctx = flat.getContext('2d');
       fctx.fillStyle = '#fff'; fctx.fillRect(0, 0, w, h); fctx.drawImage(inkCanvas, 0, 0);
 
-      if (save && st.ocr && !ocrError) {
-        // Bilder für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
-        const ocrCanvas = mkCanvas(w, h);
-        const octx = ocrCanvas.getContext('2d');
-        octx.drawImage(flat, 0, 0);
-        octx.fillStyle = '#fff';
-        for (const f of figs) if (f.kind !== 'drawing') octx.fillRect(f.x, f.y, f.w, f.h);
-        if (count >= 200) {
-          status(`${entry.name}: Seite ${n}/${total}: Text erkennen …`);
-          try { ocrPages.push({ n, text: await recognize(ocrCanvas, st, status) }); }
-          catch (e) { ocrError = e.message || String(e); }
-        } else ocrPages.push({ n, text: '' });
-        ocrCanvas.width = ocrCanvas.height = 0;
-      }
+      if (save) {
+        const figsOut = [];
+        for (const g of groups) {
+          let c, box, mime = 'image/png';
+          if (g.length === 1) { const f = base[g[0]]; c = f.canvas; box = f; if (f.kind === 'photo') mime = 'image/jpeg'; }
+          else { // zusammengefügt: Bounding-Box aller Teile, übrige Fläche transparent
+            box = unionBox(base, g); c = mkCanvas(box.w, box.h);
+            const cx = c.getContext('2d');
+            for (const i of g) cx.drawImage(base[i].canvas, base[i].x - box.x, base[i].y - box.y);
+          }
+          const dataURL = bytesToDataURL(await toBytes(c, mime), mime);
+          figsOut.push({ x: box.x, y: box.y, w: box.w, h: box.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
+        }
+        pagesOut.push({ width: w, height: h, figures: figsOut });
 
-      if (!save) {
-        // Vorschau mit nummerierten Rahmen
-        const tw = Math.min(w, 640), tk = tw / w;
+        if (st.ocr && !ocrError) {
+          // Bilder für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
+          const ocrCanvas = mkCanvas(w, h);
+          const octx = ocrCanvas.getContext('2d');
+          octx.drawImage(flat, 0, 0);
+          octx.fillStyle = '#fff';
+          for (const f of base) if (f.kind !== 'drawing') octx.fillRect(f.x, f.y, f.w, f.h);
+          if (count >= 200) {
+            status(`${entry.name}: Seite ${n}/${total}: Text erkennen …`);
+            try { ocrPages.push({ n, text: await recognize(ocrCanvas, st, status) }); }
+            catch (e) { ocrError = e.message || String(e); }
+          } else ocrPages.push({ n, text: '' });
+          ocrCanvas.width = ocrCanvas.height = 0;
+        }
+      } else {
+        // Vorschau-Hintergrund: Seite ohne Raster, Bilder in Originalfarben
+        const tw = Math.min(w, 900), tk = tw / w;
         const th = mkCanvas(tw, Math.round(h * tk));
         const tctx = th.getContext('2d');
         tctx.fillStyle = '#fff'; tctx.fillRect(0, 0, th.width, th.height);
         tctx.drawImage(flat, 0, 0, th.width, th.height);
-        for (const f of figs) if (f.kind !== 'drawing') tctx.drawImage(figCanvas.get(f), f.x * tk, f.y * tk, f.w * tk, f.h * tk);
-        tctx.lineWidth = 2; tctx.font = 'bold 13px system-ui';
-        figs.forEach((f, i) => {
-          const col = f.kind !== 'drawing' ? '#f9a73b' : '#00b5a6';
-          tctx.strokeStyle = col;
-          tctx.strokeRect(f.x * tk, f.y * tk, f.w * tk, f.h * tk);
-          tctx.fillStyle = col; tctx.fillRect(f.x * tk, f.y * tk, 22, 18);
-          tctx.fillStyle = '#04110f'; tctx.fillText(String(i + 1), f.x * tk + 5, f.y * tk + 14);
-        });
-        thumbs.push({ n, canvas: th, count: figs.length });
+        for (const f of base) if (f.kind !== 'drawing') tctx.drawImage(f.canvas, f.x * tk, f.y * tk, f.w * tk, f.h * tk);
+        pageRes.push({ n, w, h, tk, thumb: th, base: base.map((f) => ({ x: f.x, y: f.y, w: f.w, h: f.h, kind: f.kind })) });
+        // Basis-Canvas werden beim Speichern neu erzeugt – hier freigeben
+        for (const f of base) f.canvas.width = f.canvas.height = 0;
       }
       canvas.width = canvas.height = inkCanvas.width = inkCanvas.height = flat.width = flat.height = 0;
+      if (!save) base.length = 0;
       if (page) page.cleanup();
     }
   } finally { if (task) await task.destroy(); }
 
-  const res = { figTotal, nPhotos, pages: total, thumbs, saved: [], text: '', warnings };
+  const res = { elTotal, pages: total, pageRes, saved: [], text: '', warnings };
   if (!save) return res;
 
   const base = entry.name.replace(/\.(pdf|png|jpe?g|bmp|gif|webp)$/i, '');
-  if (figTotal > 0) {
+  if (elTotal > 0) {
     const scene = buildScene(pagesOut, { outline: st.outline });
     const name = await saveBlob(base, 'excalidraw', new Blob([JSON.stringify(scene)], { type: 'application/json' }));
-    res.saved.push(`${name} – ${figTotal} Element${figTotal === 1 ? '' : 'e'}, einzeln anklickbar`);
+    res.saved.push(`${name} – ${elTotal} Element${elTotal === 1 ? '' : 'e'}, einzeln anklickbar`);
   }
   if (st.ocr) {
     if (ocrError) warnings.push(`Text konnte nicht erkannt werden (${ocrError}). Die Bilder wurden trotzdem gespeichert.`);
@@ -405,7 +415,7 @@ $('btnSave').onclick = async () => {
   for (const e of entries.filter((x) => x.checked && cache.has(x.id))) {
     e.busy = true; renderResults();
     try { saved.set(e.id, await processFile(e, st, { save: true, status: (t) => { $('runState').textContent = t; } })); }
-    catch (err) { console.error(err); saved.set(e.id, { error: err.message || String(err), saved: [], warnings: [], thumbs: [] }); }
+    catch (err) { console.error(err); saved.set(e.id, { error: err.message || String(err), saved: [], warnings: [] }); }
     e.busy = false;
   }
   await closeOcr();
@@ -413,6 +423,81 @@ $('btnSave').onclick = async () => {
   renderResults();
   window.__aoDone = true;
 };
+
+// ---------- Manuelle Auswahl: anklicken oder aufziehen, zusammenfügen, entfernen ----------
+function elementTotal(e, res) {
+  return res.pageRes.reduce((s, p) => s + groupsOf(e, p.n, p.base.length).length, 0);
+}
+
+function buildEditor(entry, p) {
+  const wrap = document.createElement('div'); wrap.className = 'editor';
+  const sel = (entry.sel ||= {})[p.n] ||= new Set();
+  const groups = () => groupsOf(entry, p.n, p.base.length);
+  const boxes = () => groups().map((g) => unionBox(p.base, g));
+  const cv = document.createElement('canvas');
+  cv.width = p.thumb.width; cv.height = p.thumb.height; cv.className = 'edcanvas';
+  const bar = document.createElement('div'); bar.className = 'edbar';
+  const info = document.createElement('span'); info.className = 'muted';
+  const btn = (txt, fn, cls = 'ghost') => { const b = document.createElement('button'); b.textContent = txt; b.className = cls + ' small'; b.onclick = fn; bar.append(b); return b; };
+  let rubber = null;
+
+  function draw() {
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(p.thumb, 0, 0);
+    const bs = boxes(), tk = p.tk, many = bs.length > 80;
+    ctx.font = 'bold 13px system-ui';
+    bs.forEach((b, i) => {
+      const photo = groups()[i].some((j) => p.base[j].kind !== 'drawing');
+      const col = photo ? '#f9a73b' : '#00b5a6', on = sel.has(i);
+      if (on) { ctx.fillStyle = 'rgba(0,181,166,.28)'; ctx.fillRect(b.x * tk, b.y * tk, b.w * tk, b.h * tk); }
+      ctx.lineWidth = on ? 3 : 1.5; ctx.strokeStyle = on ? '#131419' : col;
+      ctx.strokeRect(b.x * tk, b.y * tk, b.w * tk, b.h * tk);
+      if (on) { ctx.lineWidth = 1.5; ctx.strokeStyle = '#00b5a6'; ctx.strokeRect(b.x * tk + 2, b.y * tk + 2, b.w * tk - 4, b.h * tk - 4); }
+      if (!many) { ctx.fillStyle = col; ctx.fillRect(b.x * tk, b.y * tk, 22, 18); ctx.fillStyle = '#04110f'; ctx.fillText(String(i + 1), b.x * tk + 5, b.y * tk + 14); }
+    });
+    if (rubber) {
+      const r = rect(rubber);
+      ctx.fillStyle = 'rgba(0,181,166,.15)'; ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.lineWidth = 1.5; ctx.strokeStyle = '#00b5a6'; ctx.setLineDash([6, 4]); ctx.strokeRect(r.x, r.y, r.w, r.h); ctx.setLineDash([]);
+    }
+    const n = sel.size;
+    info.textContent = n ? `${n} ausgewählt` : `${bs.length} Element${bs.length === 1 ? '' : 'e'} – anklicken oder mit der Maus aufziehen`;
+    merge.disabled = n < 2; remove.disabled = n < 1; none.disabled = n < 1; reset.disabled = !entry.edits?.[p.n];
+  }
+  const rect = (r) => ({ x: Math.min(r.x0, r.x1), y: Math.min(r.y0, r.y1), w: Math.abs(r.x1 - r.x0), h: Math.abs(r.y1 - r.y0) });
+  const pos = (ev) => { const r = cv.getBoundingClientRect(); return { x: (ev.clientX - r.left) * cv.width / r.width, y: (ev.clientY - r.top) * cv.height / r.height }; };
+  const changed = () => { saved.delete(entry.id); renderResults(); };
+
+  const merge = btn('Zusammenfügen', () => {
+    const g = groups(), pick = [...sel].sort((a, b) => a - b);
+    const merged = pick.flatMap((i) => g[i]);
+    const next = g.filter((_, i) => !sel.has(i)); next.splice(pick[0] - 0 > next.length ? next.length : pick[0], 0, merged);
+    (entry.edits ||= {})[p.n] = next; sel.clear(); sel.add(next.indexOf(merged)); changed();
+  }, 'primary');
+  const remove = btn('Entfernen', () => { (entry.edits ||= {})[p.n] = groups().filter((_, i) => !sel.has(i)); sel.clear(); changed(); });
+  const none = btn('Auswahl aufheben', () => { sel.clear(); draw(); });
+  const reset = btn('Zurücksetzen', () => { delete entry.edits?.[p.n]; sel.clear(); changed(); });
+  bar.append(info);
+
+  cv.addEventListener('pointerdown', (ev) => { cv.setPointerCapture(ev.pointerId); const q = pos(ev); rubber = { x0: q.x, y0: q.y, x1: q.x, y1: q.y }; });
+  cv.addEventListener('pointermove', (ev) => { if (!rubber) return; const q = pos(ev); rubber.x1 = q.x; rubber.y1 = q.y; draw(); });
+  cv.addEventListener('pointerup', (ev) => {
+    if (!rubber) return;
+    const r = rect(rubber); rubber = null;
+    const bs = boxes(), tk = p.tk;
+    if (r.w < 5 && r.h < 5) { // Klick: kleinstes Element unter dem Zeiger umschalten
+      let hit = -1, area = Infinity;
+      bs.forEach((b, i) => { const x = r.x / tk, y = r.y / tk; if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h && b.w * b.h < area) { hit = i; area = b.w * b.h; } });
+      if (hit < 0) sel.clear(); else if (sel.has(hit)) sel.delete(hit); else sel.add(hit);
+    } else { // Aufziehen: alle Elemente, deren Mitte im Rahmen liegt, zur Auswahl hinzufügen
+      bs.forEach((b, i) => { const cx = (b.x + b.w / 2) * tk, cy = (b.y + b.h / 2) * tk; if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) sel.add(i); });
+    }
+    draw();
+  });
+  wrap.append(cv, bar);
+  draw();
+  return wrap;
+}
 
 function renderResults() {
   const box = $('results');
@@ -429,10 +514,10 @@ function renderResults() {
     if (e.error) { p.className = 'err'; p.textContent = 'Fehler: ' + e.error; }
     else if (e.busy && !c) { p.className = 'muted'; p.textContent = 'Wird analysiert …'; }
     else if (c) {
-      const r = c.res;
-      p.className = r.figTotal ? 'ok' : 'muted';
-      p.textContent = r.figTotal
-        ? `${r.figTotal} Element${r.figTotal === 1 ? '' : 'e'} erkannt${r.pages > 1 ? ` auf ${r.pages} Seiten` : ''}`
+      const r = c.res, n = elementTotal(e, r);
+      p.className = n ? 'ok' : 'muted';
+      p.textContent = n
+        ? `${n} Element${n === 1 ? '' : 'e'} erkannt${r.pages > 1 ? ` auf ${r.pages} Seiten` : ''}`
         : 'Nichts Ausschneidbares gefunden – unter „Erweitert“ lässt sich das anpassen.';
       if (s) {
         const ul = document.createElement('ul');
@@ -440,14 +525,10 @@ function renderResults() {
         for (const t of [...(s.warnings || []), ...(s.error ? [s.error] : [])]) { const li = document.createElement('li'); li.className = 'warn'; li.textContent = t; ul.append(li); }
         card.append(ul);
       }
-      const tb = document.createElement('div'); tb.className = 'thumbs';
-      for (const t of r.thumbs) {
-        const fig = document.createElement('figure');
-        fig.append(t.canvas);
-        const cap = document.createElement('figcaption'); cap.textContent = r.pages > 1 ? `Seite ${t.n}: ${t.count} Element(e)` : `${t.count} Element(e)`;
-        fig.append(cap); tb.append(fig);
+      for (const pg of r.pageRes) {
+        if (r.pages > 1) { const cap = document.createElement('div'); cap.className = 'muted'; cap.textContent = `Seite ${pg.n}`; card.append(cap); }
+        card.append(buildEditor(e, pg));
       }
-      card.append(tb);
       if (s && s.text) {
         const d = document.createElement('details'); d.style.marginTop = '10px';
         const sm = document.createElement('summary'); sm.textContent = 'Erkannten Text anzeigen'; d.append(sm);
