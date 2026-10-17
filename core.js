@@ -299,6 +299,29 @@ function cropOpaque(src, w, x, y, cwid, chei) {
   return out;
 }
 
+/**
+ * Von Hand aufgezogener Rahmen: alle Tintenpixel darin als ein Element, auf den Inhalt zugeschnitten,
+ * Löcher mit Originalfarbe gefüllt. Liefert null, wenn im Rahmen nichts steht.
+ */
+export function cropManual(src, ink, w, h, r) {
+  const rx0 = Math.max(0, Math.floor(r.x)), ry0 = Math.max(0, Math.floor(r.y));
+  const rx1 = Math.min(w, Math.ceil(r.x + r.w)), ry1 = Math.min(h, Math.ceil(r.y + r.h));
+  let x0 = Infinity, y0 = Infinity, x1 = -1, y1 = -1;
+  for (let y = ry0; y < ry1; y++) for (let x = rx0; x < rx1; x++) {
+    if (ink[(y * w + x) * 4 + 3]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  }
+  if (x1 < 0) return null;
+  const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+  const rgba = new Uint8ClampedArray(cw * ch * 4);
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const si = ((y0 + y) * w + x0 + x) * 4;
+    if (ink[si + 3]) rgba.set(ink.subarray(si, si + 4), (y * cw + x) * 4);
+  }
+  const it = { x: x0, y: y0, w: cw, h: ch, rgba };
+  fillHoles(it, src, w);
+  return it;
+}
+
 /** Fotos als Rechtecke (Originalfarben) + übrige Zeichnungen/Text gruppiert, gemeinsame Lesereihenfolge. */
 export function segmentAll(src, ink, w, h, opts = {}) {
   const o = { ...DEFAULTS, ...opts };

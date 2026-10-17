@@ -1,7 +1,7 @@
 import * as pdfjs from './lib/pdf.min.mjs';
 import {
   DEFAULTS, estimateBackground, extractInk, segmentAll, buildScene,
-  bytesToDataURL, sha1Hex, buildTxt, uniqueName, cleanOcrLines,
+  bytesToDataURL, sha1Hex, buildTxt, uniqueName, cleanOcrLines, cropManual,
 } from './core.js';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('./lib/pdf.worker.min.mjs', import.meta.url).href;
@@ -11,7 +11,7 @@ const PDF_OPTS = {
   isEvalSupported: false,
 };
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const APP_VERSION = '1.6';
+const APP_VERSION = '1.7';
 const PAGE_W = 1600; // Zielbreite beim Rendern (px)
 
 const $ = (id) => document.getElementById(id);
@@ -304,8 +304,20 @@ async function processFile(entry, st, { save, status }) {
         f.rgba = null;
         return { x: f.x, y: f.y, w: f.w, h: f.h, kind: f.kind, canvas: c };
       });
-      const groups = groupsOf(entry, n, base.length);
-      elTotal += groups.length;
+      // Von Hand aufgezogene Elemente (Rahmen in Seitenkoordinaten) hängen sich hinter die erkannten Figuren
+      const nMan = entry.manual?.[n]?.length || 0;
+      if (save) {
+        for (const r of entry.manual?.[n] || []) {
+          const m = cropManual(rgba, ink, w, h, r);
+          if (!m) { base.push({ x: r.x, y: r.y, w: 1, h: 1, kind: 'image', empty: true, canvas: mkCanvas(1, 1) }); continue; }
+          const c = mkCanvas(m.w, m.h);
+          c.getContext('2d').putImageData(new ImageData(m.rgba, m.w, m.h), 0, 0);
+          base.push({ x: m.x, y: m.y, w: m.w, h: m.h, kind: 'image', manual: true, canvas: c });
+        }
+      }
+      const groups = groupsOf(entry, n, base.length + (save ? 0 : nMan))
+        .map((g) => g.filter((i) => !base[i]?.empty)).filter((g) => g.length || !save);
+      if (!save) elTotal += groups.length;
 
       // Seite ohne Raster, weiß hinterlegt (inkl. Bilder in Originalfarben)
       const inkCanvas = mkCanvas(w, h);
@@ -328,6 +340,7 @@ async function processFile(entry, st, { save, status }) {
           figsOut.push({ x: box.x, y: box.y, w: box.w, h: box.h, dataURL, mime, fileId: await sha1Hex(dataURL) });
         }
         pagesOut.push({ width: w, height: h, figures: figsOut });
+        elTotal += figsOut.length;
 
         if (st.ocr && !ocrError) {
           // Bilder für die OCR weißen (sonst entsteht Zeichenmüll aus dem Bildinhalt)
@@ -335,7 +348,8 @@ async function processFile(entry, st, { save, status }) {
           const octx = ocrCanvas.getContext('2d');
           octx.drawImage(flat, 0, 0);
           octx.fillStyle = '#fff';
-          for (const f of base) if (f.kind !== 'drawing') octx.fillRect(f.x, f.y, f.w, f.h);
+          const used = new Set(groups.flat());
+          base.forEach((f, i) => { if (f.kind !== 'drawing' && !f.empty && (!f.manual || used.has(i))) octx.fillRect(f.x, f.y, f.w, f.h); });
           if (count >= 200) {
             status(`${entry.name}: Seite ${n}/${total}: Text erkennen …`);
             try { ocrPages.push({ n, text: await recognize(ocrCanvas, st, status) }); }
@@ -426,14 +440,17 @@ $('btnSave').onclick = async () => {
 
 // ---------- Manuelle Auswahl: anklicken oder aufziehen, zusammenfügen, entfernen ----------
 function elementTotal(e, res) {
-  return res.pageRes.reduce((s, p) => s + groupsOf(e, p.n, p.base.length).length, 0);
+  return res.pageRes.reduce((s, p) => s + groupsOf(e, p.n, p.base.length + (e.manual?.[p.n]?.length || 0)).length, 0);
 }
 
 function buildEditor(entry, p) {
   const wrap = document.createElement('div'); wrap.className = 'editor';
   const sel = (entry.sel ||= {})[p.n] ||= new Set();
-  const groups = () => groupsOf(entry, p.n, p.base.length);
-  const boxes = () => groups().map((g) => unionBox(p.base, g));
+  const all = () => p.base.concat((entry.manual?.[p.n] || []).map((r) => ({ ...r, kind: 'image' })));
+  const groups = () => groupsOf(entry, p.n, all().length);
+  const boxes = () => { const a = all(); return groups().map((g) => unionBox(a, g)); };
+  const dmState = (entry.dm ||= {});
+  const isDraw = () => !!dmState[p.n];
   const cv = document.createElement('canvas');
   cv.width = p.thumb.width; cv.height = p.thumb.height; cv.className = 'edcanvas';
   const bar = document.createElement('div'); bar.className = 'edbar';
@@ -444,10 +461,10 @@ function buildEditor(entry, p) {
   function draw() {
     const ctx = cv.getContext('2d');
     ctx.drawImage(p.thumb, 0, 0);
-    const bs = boxes(), tk = p.tk, many = bs.length > 80;
+    const bs = boxes(), tk = p.tk, many = bs.length > 80, a = all();
     ctx.font = 'bold 13px system-ui';
     bs.forEach((b, i) => {
-      const photo = groups()[i].some((j) => p.base[j].kind !== 'drawing');
+      const photo = groups()[i].some((j) => a[j].kind !== 'drawing');
       const col = photo ? '#f9a73b' : '#00b5a6', on = sel.has(i);
       if (on) { ctx.fillStyle = 'rgba(0,181,166,.28)'; ctx.fillRect(b.x * tk, b.y * tk, b.w * tk, b.h * tk); }
       ctx.lineWidth = on ? 3 : 1.5; ctx.strokeStyle = on ? '#131419' : col;
@@ -457,12 +474,15 @@ function buildEditor(entry, p) {
     });
     if (rubber) {
       const r = rect(rubber);
-      ctx.fillStyle = 'rgba(0,181,166,.15)'; ctx.fillRect(r.x, r.y, r.w, r.h);
-      ctx.lineWidth = 1.5; ctx.strokeStyle = '#00b5a6'; ctx.setLineDash([6, 4]); ctx.strokeRect(r.x, r.y, r.w, r.h); ctx.setLineDash([]);
+      const rc = isDraw() ? '#f9a73b' : '#00b5a6';
+      ctx.fillStyle = isDraw() ? 'rgba(249,167,59,.18)' : 'rgba(0,181,166,.15)'; ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.lineWidth = 1.5; ctx.strokeStyle = rc; ctx.setLineDash([6, 4]); ctx.strokeRect(r.x, r.y, r.w, r.h); ctx.setLineDash([]);
     }
     const n = sel.size;
-    info.textContent = n ? `${n} ausgewählt` : `${bs.length} Element${bs.length === 1 ? '' : 'e'} – anklicken oder mit der Maus aufziehen`;
-    merge.disabled = n < 2; remove.disabled = n < 1; none.disabled = n < 1; reset.disabled = !entry.edits?.[p.n];
+    info.textContent = isDraw() ? 'Rahmen um das fehlende Element ziehen' : n ? `${n} ausgewählt` : `${bs.length} Element${bs.length === 1 ? '' : 'e'} – anklicken oder mit der Maus aufziehen`;
+    merge.disabled = n < 2; remove.disabled = n < 1; none.disabled = n < 1; reset.disabled = !entry.edits?.[p.n] && !entry.manual?.[p.n]?.length;
+    draw_.className = (isDraw() ? 'primary' : 'ghost') + ' small'; draw_.textContent = isDraw() ? 'Element aufziehen: an' : 'Element aufziehen';
+    cv.style.cursor = 'crosshair'; cv.classList.toggle('drawing', isDraw());
   }
   const rect = (r) => ({ x: Math.min(r.x0, r.x1), y: Math.min(r.y0, r.y1), w: Math.abs(r.x1 - r.x0), h: Math.abs(r.y1 - r.y0) });
   const pos = (ev) => { const r = cv.getBoundingClientRect(); return { x: (ev.clientX - r.left) * cv.width / r.width, y: (ev.clientY - r.top) * cv.height / r.height }; };
@@ -476,7 +496,8 @@ function buildEditor(entry, p) {
   }, 'primary');
   const remove = btn('Entfernen', () => { (entry.edits ||= {})[p.n] = groups().filter((_, i) => !sel.has(i)); sel.clear(); changed(); });
   const none = btn('Auswahl aufheben', () => { sel.clear(); draw(); });
-  const reset = btn('Zurücksetzen', () => { delete entry.edits?.[p.n]; sel.clear(); changed(); });
+  const reset = btn('Zurücksetzen', () => { delete entry.edits?.[p.n]; delete entry.manual?.[p.n]; sel.clear(); changed(); });
+  const draw_ = btn('Element aufziehen', () => { dmState[p.n] = !isDraw(); draw(); });
   bar.append(info);
 
   cv.addEventListener('pointerdown', (ev) => { cv.setPointerCapture(ev.pointerId); const q = pos(ev); rubber = { x0: q.x, y0: q.y, x1: q.x, y1: q.y }; });
@@ -485,6 +506,14 @@ function buildEditor(entry, p) {
     if (!rubber) return;
     const r = rect(rubber); rubber = null;
     const bs = boxes(), tk = p.tk;
+    if (isDraw()) { // neues Element aus dem aufgezogenen Rahmen
+      if (r.w < 8 || r.h < 8) { draw(); return; }
+      const man = ((entry.manual ||= {})[p.n] ||= []);
+      const had = groups(); // vor dem Hinzufügen sichern (bei Standard-Gruppen wächst die Liste von selbst)
+      man.push({ x: Math.round(r.x / tk), y: Math.round(r.y / tk), w: Math.round(r.w / tk), h: Math.round(r.h / tk) });
+      if (entry.edits?.[p.n]) entry.edits[p.n] = [...had, [all().length - 1]];
+      sel.clear(); sel.add(groups().length - 1); changed(); return;
+    }
     if (r.w < 5 && r.h < 5) { // Klick: kleinstes Element unter dem Zeiger umschalten
       let hit = -1, area = Infinity;
       bs.forEach((b, i) => { const x = r.x / tk, y = r.y / tk; if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h && b.w * b.h < area) { hit = i; area = b.w * b.h; } });
